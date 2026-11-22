@@ -1,0 +1,37 @@
+{
+  "preview": {
+    "services": [
+      {
+        "bundleId": "local.routeweaver.mac",
+        "command": [
+          "bash",
+          "-lc",
+          "./Scripts/build-app.sh && open -g -n ./dist/RouteWeaver.app"
+        ],
+        "stop": [
+          "bash",
+          "-lc",
+          "pkill -TERM -x RouteWeaver || true; for i in $(seq 1 20); do pgrep -x RouteWeaver >/dev/null || exit 0; sleep 0.1; done; pkill -KILL -x RouteWeaver || true"
+        ],
+        "cwd": ".",
+        "defaultPath": null,
+        "dependsOn": [],
+        "env": {},
+        "healthPath": "/health",
+        "id": "routeweaver",
+        "kind": "macos-app",
+        "name": "RouteWeaver",
+        "port": {
+          "args": [],
+          "env": null,
+          "fixed": null
+        },
+        "preferredPort": null,
+        "readyTimeoutMs": 120000,
+        "route": "direct",
+        "source": "configured"
+      }
+    ],
+    "version": 1
+  }
+}

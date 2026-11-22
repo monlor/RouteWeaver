@@ -1,0 +1,98 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release macOS (arm64 + x86_64)
+    runs-on: macos-15
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        run: swift test
+
+      - name: Build & Package macOS artifacts
+        run: |
+          mkdir -p release-assets
+
+          package_arch() {
+            local arch="$1"
+            local out_dir="$PWD/dist-${arch}"
+            echo "=== Building RouteWeaver ${{ steps.meta.outputs.version }} (${arch}) ==="
+            TARGET_ARCH="${arch}" \
+            APP_VERSION="${{ steps.meta.outputs.version }}" \
+            APP_BUILD="${{ steps.meta.outputs.build }}" \
+            DIST_DIR="${out_dir}" \
+            SKIP_TESTS=1 \
+            SKIP_ICON_COMPILE=1 \
+            MIHOMO_FORCE_DOWNLOAD=1 \
+            ./Scripts/build-app.sh
+
+            local app_path="${out_dir}/RouteWeaver.app"
+            local base_name="RouteWeaver-${{ steps.meta.outputs.version }}-macos-${arch}"
+
+            # ZIP archive (preserves macOS bundle metadata & code signatures)
+            ditto -c -k --sequesterRsrc --keepParent "${app_path}" "release-assets/${base_name}.zip"
+
+            # DMG disk image with Applications symlink
+            local dmg_stage="${out_dir}/dmg-stage"
+            rm -rf "${dmg_stage}"
+            mkdir -p "${dmg_stage}"
+            cp -R "${app_path}" "${dmg_stage}/RouteWeaver.app"
+            ln -s /Applications "${dmg_stage}/Applications"
+            hdiutil create \
+              -volname "RouteWeaver ${{ steps.meta.outputs.version }}" \
+              -srcfolder "${dmg_stage}" \
+              -ov -format UDZO \
+              "release-assets/${base_name}.dmg"
+            rm -rf "${dmg_stage}"
+          }
+
+          package_arch arm64
+          package_arch x86_64
+
+          (
+            cd release-assets
+            shasum -a 256 *.dmg *.zip > SHA256SUMS.txt
+          )
+          ls -lh release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: RouteWeaver ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.dmg
+            release-assets/*.zip
+            release-assets/SHA256SUMS.txt

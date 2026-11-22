@@ -2,130 +2,580 @@ import Foundation
 
 public enum RoutingConfigurationError: LocalizedError, Equatable {
     case invalidInterface(String)
-    case duplicateUplink
     case invalidSubscription(String)
     case invalidPattern(String)
-    case ambiguousEntryPattern
+    case invalidTarget(String)
+    case ambiguousRelayPattern(String)
+    case duplicateTargetName(String)
     case invalidPort(String)
     case invalidController
+    case invalidRule(String)
+    case invalidDNS(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidInterface(let field):
-            return "\(field)：请选择有效的 macOS 网络接口（例如 en0）。"
-        case .duplicateUplink:
-            return "双网卡配置必须选择两个不同的接口；如要共用一个接口，请选择单网卡模板。"
+            return "\(field)：请选择有效的 macOS 网络接口（例如 en0，不能为 lo0 或 utun）。"
         case .invalidSubscription(let field):
-            return "\(field)：请输入 HTTPS 的 Mihomo 节点订阅地址。"
+            return "\(field)：请输入有效的 HTTPS 订阅地址。"
         case .invalidPattern(let field):
             return "\(field)：正则表达式无效，或包含不支持的反引号、控制字符。"
-        case .ambiguousEntryPattern:
-            return "入口 L 与 A/B 共用订阅时，请为 L 设置专用的非空正则，不能与 A 或 B 的正则完全相同。"
+        case .invalidTarget(let detail):
+            return "网络目标配置不完整：\(detail)"
+        case .ambiguousRelayPattern(let targetName):
+            return "网络目标「\(targetName)」的出口节点组与链式节点组共用同一订阅时，链式节点组必须设置非空且不同于出口组的正则，避免循环代理。"
+        case .duplicateTargetName(let name):
+            return "网络目标名称「\(name)」重复，请确保每个网络目标名称唯一。"
         case .invalidPort(let field):
-            return "\(field)：请输入 1024–65535 范围内、不与其他端口重复的端口。"
+            return "\(field)：请输入 1024–65535 范围内、且不与其他端口重复的端口。"
         case .invalidController:
             return "控制接口必须同时提供端口和非空密钥。"
+        case .invalidRule(let detail):
+            return "规则无效：\(detail)"
+        case .invalidDNS(let detail):
+            return "自定义 DNS 无效：\(detail)"
         }
     }
 }
 
+public struct PreloadResourceItem: Equatable, Sendable {
+    public enum Kind: String, Sendable {
+        case proxyProvider
+        case ruleProvider
+    }
+
+    public let key: String
+    public let url: String
+    public let relativePath: String
+    public let kind: Kind
+
+    public init(key: String, url: String, relativePath: String, kind: Kind) {
+        self.key = key
+        self.url = url
+        self.relativePath = relativePath
+        self.kind = kind
+    }
+}
+
+public struct RenderedMihomoConfig: Sendable {
+    public let data: Data
+    public let activeProxyGroupNames: [String]
+    public let requiredInterfaces: [String]
+    public let tunEnabled: Bool
+    public let gatewayModeEnabled: Bool
+    public let preloadResources: [PreloadResourceItem]
+}
+
 public enum MihomoConfig {
     public static let minimumVersion = "1.19.27"
-    public static let claudeOutbound = "Claude-Interface"
-    public static let domesticOutbound = "Domestic-Interface"
-    public static let entryGroup = "Entry-L"
-    public static let groupA = "Group-A"
-    public static let groupB = "Group-B"
-    public static let providerL = "entry-l"
-    public static let providerA = "exit-a"
-    public static let providerB = "exit-b"
     public static let healthCheckURL = "https://www.gstatic.com/generate_204"
+    public static let defaultFakeIPRange = "198.18.0.1/16"
+    public static let defaultFakeIPFilter: [String] = [
+        "*.lan",
+        "*.local",
+        "*.localdomain",
+        "*.example",
+        "*.invalid",
+        "*.localhost",
+        "*.test",
+        "*.home.arpa",
+        "localhost.ptlogin2.qq.com",
+        "localhost.sec.qq.com",
+        "+.msftconnecttest.com",
+        "+.msftncsi.com",
+        "time.*.com",
+        "time.*.gov",
+        "time.*.edu.cn",
+        "time.*.apple.com",
+        "ntp.*.com",
+        "*.ntp.org.cn",
+        "+.pool.ntp.org",
+        "time1.cloud.tencent.com",
+        "stun.*.*",
+        "stun.*.*.*",
+    ]
 
     /// Older engines ignore the fail-closed `empty-fallback` policy.
     public static func supportsVersionOutput(_ output: String) -> Bool {
+        guard let versionString = parseVersion(from: output) else { return false }
+        return compareVersions(versionString, minimumVersion) != .orderedAscending
+    }
+
+    /// Extracts the semantic version (e.g. `v1.19.27`) from `mihomo -v` output.
+    public static func parseVersion(from output: String) -> String? {
         for line in output.split(whereSeparator: \.isNewline) {
             let words = line.split(whereSeparator: \.isWhitespace)
             guard words.count > 2, words[0] == "Mihomo", words[1] == "Meta" else { continue }
-            let token = words[2]
-            let clean = token.hasPrefix("v") ? token.dropFirst() : token
+            let token = String(words[2])
+            let clean = token.hasPrefix("v") ? String(token.dropFirst()) : token
             let pieces = clean.split(separator: ".", omittingEmptySubsequences: false)
             guard pieces.count == 3,
                   pieces.allSatisfy({ piece in
                       !piece.isEmpty && piece.utf8.allSatisfy { (48...57).contains($0) }
-                  }) else { return false }
-            let version = pieces.compactMap { Int($0) }
-            return version.count == 3 && !version.lexicographicallyPrecedes([1, 19, 27])
+                  }) else { return nil }
+            return token.hasPrefix("v") ? token : "v\(clean)"
         }
-        return false
+        return nil
     }
 
-    /// JSON uses YAML 1.2 flow syntax. The core's own config check is authoritative
-    /// for its supported syntax and data files.
+    /// Compares two semantic version strings (with or without leading `v`).
+    public static func compareVersions(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        func parts(_ s: String) -> [Int] {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            let clean = trimmed.hasPrefix("v") || trimmed.hasPrefix("V") ? String(trimmed.dropFirst()) : trimmed
+            return clean.split(separator: ".").compactMap { Int($0) }
+        }
+        let a = parts(lhs)
+        let b = parts(rhs)
+        let count = max(a.count, b.count)
+        for idx in 0..<count {
+            let av = idx < a.count ? a[idx] : 0
+            let bv = idx < b.count ? b[idx] : 0
+            if av < bv { return .orderedAscending }
+            if av > bv { return .orderedDescending }
+        }
+        return .orderedSame
+    }
+
     public static func render(
         _ profile: RoutingProfile,
         controllerPort: Int? = nil,
-        secret: String? = nil
+        secret: String? = nil,
+        interfaceDNS: [String: [String]] = [:]
     ) throws -> Data {
-        let claudeInterface = try checkedInterface(profile.effectiveClaudeInterface, field: "Claude 出口")
-        let domesticInterface = try checkedInterface(profile.domesticInterface, field: "国内出口")
-        if !profile.useDomesticInterfaceForClaude, claudeInterface == domesticInterface {
-            throw RoutingConfigurationError.duplicateUplink
-        }
-        let exitURL = try checkedURL(profile.exitProviderURL, field: "出口 A/B 订阅")
-        let sharesExitProvider = profile.entryProviderURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let entryURL = sharesExitProvider
-            ? exitURL
-            : try checkedURL(profile.entryProviderURL, field: "入口 L 订阅")
-        let entryPattern = try checkedPattern(profile.entryPattern, field: "入口 L")
-        let groupAPattern = try checkedPattern(profile.groupAPattern, field: "节点组 A")
-        let groupBPattern = try checkedPattern(profile.groupBPattern, field: "节点组 B")
-        if entryURL == exitURL, entryPattern.isEmpty || entryPattern == groupAPattern || entryPattern == groupBPattern {
-            throw RoutingConfigurationError.ambiguousEntryPattern
-        }
+        try renderDetailed(profile, controllerPort: controllerPort, secret: secret, interfaceDNS: interfaceDNS).data
+    }
+
+    /// Renders a self-contained Mihomo JSON (valid YAML 1.2) configuration.
+    public static func renderDetailed(
+        _ profile: RoutingProfile,
+        controllerPort: Int? = nil,
+        secret: String? = nil,
+        interfaceDNS: [String: [String]] = [:]
+    ) throws -> RenderedMihomoConfig {
+        // 1. Validate listener ports
+        var usedPorts = Set<Int>()
         guard (1024...65535).contains(profile.mixedPort) else {
-            throw RoutingConfigurationError.invalidPort("本地代理端口")
+            throw RoutingConfigurationError.invalidPort("混合代理端口")
+        }
+        usedPorts.insert(profile.mixedPort)
+
+        if let httpPort = profile.httpPort {
+            guard (1024...65535).contains(httpPort), usedPorts.insert(httpPort).inserted else {
+                throw RoutingConfigurationError.invalidPort("独立 HTTP 端口")
+            }
+        }
+        if let socksPort = profile.socksPort {
+            guard (1024...65535).contains(socksPort), usedPorts.insert(socksPort).inserted else {
+                throw RoutingConfigurationError.invalidPort("独立 SOCKS5 端口")
+            }
+        }
+
+        // 2. Collect all referenced targets (from enabled rule groups + fallback target)
+        let activeTargetIDs = profile.activeTargetIDs
+        var targetNameSet = Set<String>()
+        var outboundNameByTargetID: [UUID: String] = [:]
+
+        for target in profile.targets where activeTargetIDs.contains(target.id) {
+            let cleanName = try checkedTargetName(target.name)
+            guard targetNameSet.insert(cleanName).inserted else {
+                throw RoutingConfigurationError.duplicateTargetName(cleanName)
+            }
+            outboundNameByTargetID[target.id] = cleanName
+        }
+
+        // Verify fallback target exists if not REJECT
+        if case .target(let id) = profile.fallbackTarget, outboundNameByTargetID[id] == nil {
+            throw RoutingConfigurationError.invalidTarget("默认兜底目标不存在，请重新选择。")
+        }
+
+        // Verify every enabled rule group with rules points to an existing target
+        for group in profile.ruleGroups where group.isEnabled && !group.rules.filter(\.isEnabled).isEmpty {
+            if case .target(let id) = group.target, outboundNameByTargetID[id] == nil {
+                throw RoutingConfigurationError.invalidTarget("规则组「\(group.name)」指向的网络目标不存在。")
+            }
+        }
+
+        // 3. Build proxies, proxy-providers, and proxy-groups for all active targets
+        var proxies: [[String: Any]] = []
+        var providers: [String: [String: Any]] = [:]
+        var providerKeyBySignature: [String: String] = [:]
+        var proxyGroups: [[String: Any]] = []
+        var activeProxyGroupNames: [String] = []
+        var requiredInterfaces = Set<String>()
+        var usedOutboundNames = targetNameSet
+
+        func ensureSharedProvider(url: String, interface: String?) -> String {
+            let signature = "\(url)\u{0}\(interface ?? "")"
+            if let existing = providerKeyBySignature[signature] {
+                return existing
+            }
+            let key = "p-\(shortHash(signature))"
+            providers[key] = provider(
+                url: url,
+                key: key,
+                pattern: "",
+                excludePattern: "",
+                prefix: "",
+                dialer: "",
+                interface: interface
+            )
+            providerKeyBySignature[signature] = key
+            return key
+        }
+
+        for (index, target) in profile.targets.enumerated() where activeTargetIDs.contains(target.id) {
+            let outboundName = outboundNameByTargetID[target.id]!
+            let boundInterface: String?
+            if let rawIface = target.normalizedInterface {
+                let checked = try checkedInterface(rawIface, field: "网络目标「\(outboundName)」网卡")
+                boundInterface = checked
+                requiredInterfaces.insert(checked)
+            } else {
+                boundInterface = nil
+            }
+
+            switch target.mode {
+            case .direct:
+                proxies.append(directProxy(outboundName, interface: boundInterface))
+
+            case .proxy:
+                guard let exitGroup = profile.nodeGroup(id: target.exitGroupID) else {
+                    throw RoutingConfigurationError.invalidTarget("「\(outboundName)」未选择出口节点组。")
+                }
+                guard let exitSub = profile.subscription(id: exitGroup.subscriptionID) else {
+                    throw RoutingConfigurationError.invalidTarget("「\(outboundName)」的出口节点组「\(exitGroup.name)」尚未绑定订阅。")
+                }
+                let exitURL = try checkedURL(exitSub.url, field: "订阅「\(exitSub.name)」")
+                let exitPattern = try checkedPattern(exitGroup.filterPattern, field: "节点组「\(exitGroup.name)」")
+                let exitExcludePattern = try checkedPattern(exitGroup.excludeFilterPattern, field: "节点组「\(exitGroup.name)」排除正则")
+
+                var dialerGroupName = ""
+
+                if let relayID = target.relayGroupID {
+                    guard let relayGroup = profile.nodeGroup(id: relayID) else {
+                        throw RoutingConfigurationError.invalidTarget("「\(outboundName)」选择的链式节点组不存在。")
+                    }
+                    guard let relaySub = profile.subscription(id: relayGroup.subscriptionID) else {
+                        throw RoutingConfigurationError.invalidTarget("「\(outboundName)」的链式节点组「\(relayGroup.name)」尚未绑定订阅。")
+                    }
+                    let relayURL = try checkedURL(relaySub.url, field: "订阅「\(relaySub.name)」")
+                    let relayPattern = try checkedPattern(relayGroup.filterPattern, field: "节点组「\(relayGroup.name)」")
+                    let relayExcludePattern = try checkedPattern(relayGroup.excludeFilterPattern, field: "节点组「\(relayGroup.name)」排除正则")
+
+                    if relayURL == exitURL,
+                       (relayPattern.isEmpty && relayExcludePattern.isEmpty)
+                       || (relayPattern == exitPattern && relayExcludePattern == exitExcludePattern) {
+                        throw RoutingConfigurationError.ambiguousRelayPattern(outboundName)
+                    }
+
+                    let relayMihomoGroupName = "\(outboundName)·链式"
+                    guard usedOutboundNames.insert(relayMihomoGroupName).inserted else {
+                        throw RoutingConfigurationError.duplicateTargetName(relayMihomoGroupName)
+                    }
+                    let relayProviderKey = ensureSharedProvider(url: relayURL, interface: boundInterface)
+                    proxyGroups.append(
+                        proxyGroup(
+                            relayMihomoGroupName,
+                            provider: relayProviderKey,
+                            pattern: relayPattern,
+                            excludePattern: relayExcludePattern,
+                            automatic: relayGroup.autoTest
+                        )
+                    )
+                    activeProxyGroupNames.append(relayMihomoGroupName)
+                    dialerGroupName = relayMihomoGroupName
+                }
+
+                if dialerGroupName.isEmpty {
+                    let exitProviderKey = ensureSharedProvider(url: exitURL, interface: boundInterface)
+                    proxyGroups.append(
+                        proxyGroup(
+                            outboundName,
+                            provider: exitProviderKey,
+                            pattern: exitPattern,
+                            excludePattern: exitExcludePattern,
+                            automatic: exitGroup.autoTest
+                        )
+                    )
+                } else {
+                    // Chained exit needs a dedicated provider for `dialer-proxy` and `additional-prefix`;
+                    // apply filter/exclude-filter on the provider so they run before `additional-prefix`.
+                    let exitProviderKey = "t\(index)-\(shortHash(target.id.uuidString))-exit"
+                    providers[exitProviderKey] = provider(
+                        url: exitURL,
+                        key: exitProviderKey,
+                        pattern: exitPattern,
+                        excludePattern: exitExcludePattern,
+                        prefix: "[\(outboundName)] ",
+                        dialer: dialerGroupName,
+                        interface: nil
+                    )
+                    proxyGroups.append(
+                        proxyGroup(
+                            outboundName,
+                            provider: exitProviderKey,
+                            pattern: "",
+                            excludePattern: "",
+                            automatic: exitGroup.autoTest,
+                            tolerance: 100
+                        )
+                    )
+                }
+                activeProxyGroupNames.append(outboundName)
+            }
+        }
+
+        // 4. Collect target metadata (mode & bound interface) for DNS routing and rule-provider proxy selection
+        var targetByID: [UUID: NetworkTarget] = [:]
+        var boundInterfaceByTargetID: [UUID: String] = [:]
+        for target in profile.targets where activeTargetIDs.contains(target.id) {
+            targetByID[target.id] = target
+            if let iface = target.normalizedInterface {
+                boundInterfaceByTargetID[target.id] = iface
+            }
+        }
+
+        let preferredProxyGroupName: String? = {
+            if case .target(let id) = profile.fallbackTarget,
+               targetByID[id]?.mode == .proxy,
+               let name = outboundNameByTargetID[id] {
+                return name
+            }
+            for target in profile.targets where activeTargetIDs.contains(target.id) && target.mode == .proxy {
+                if let name = outboundNameByTargetID[target.id] {
+                    return name
+                }
+            }
+            return nil
+        }()
+
+        // 5. Build rules, rule-providers, and DNS nameserver-policy entries in rule priority order
+        let builtRules = try buildRules(
+            profile: profile,
+            outboundNameByTargetID: outboundNameByTargetID,
+            targetByID: targetByID,
+            boundInterfaceByTargetID: boundInterfaceByTargetID,
+            preferredProxyGroupName: preferredProxyGroupName,
+            interfaceDNS: interfaceDNS
+        )
+
+        let useTun = profile.effectiveTunEnabled
+        let allowLAN = profile.effectiveAllowLAN
+        let gatewayEnabled = profile.gatewayModeEnabled
+
+        let tunConfig: [String: Any]
+        if useTun {
+            var tun: [String: Any] = [
+                "enable": true,
+                "stack": profile.tunStack.rawValue,
+                "auto-route": true,
+                "auto-detect-interface": true,
+                "strict-route": profile.tunStrictRoute,
+                "dns-hijack": ["any:53", "tcp://any:53"],
+            ]
+            if gatewayEnabled {
+                tun["endpoint-independent-nat"] = true
+            }
+            tunConfig = tun
+        } else {
+            tunConfig = ["enable": false]
         }
 
         var config: [String: Any] = [
             "mode": "rule",
             "mixed-port": profile.mixedPort,
-            "allow-lan": false,
-            "bind-address": "127.0.0.1",
-            "log-level": "warning",
+            "allow-lan": allowLAN,
+            "bind-address": allowLAN ? "*" : "127.0.0.1",
+            "log-level": profile.logLevel.rawValue,
             "ipv6": true,
-            "find-process-mode": "off",
-            "tun": ["enable": false],
+            "tcp-concurrent": true,
+            "unified-delay": true,
+            "keep-alive-idle": 15,
+            "keep-alive-interval": 15,
+            "find-process-mode": (useTun || builtRules.hasProcessRule || !builtRules.ruleProviders.isEmpty) ? "strict" : "off",
+            "geo-auto-update": false,
+            "geox-url": BundledResourceManager.defaultGeoURLs,
+            "tun": tunConfig,
             "profile": ["store-selected": true],
-            "proxies": [
-                direct(claudeOutbound, interface: claudeInterface),
-                direct(domesticOutbound, interface: domesticInterface),
-            ],
-            "proxy-providers": [
-                providerL: provider(
-                    url: entryURL, key: providerL, pattern: entryPattern, prefix: "L · ",
-                    dialer: "", interface: domesticInterface, automatic: profile.entryAutoTest
-                ),
-                providerA: provider(
-                    url: exitURL, key: providerA, pattern: groupAPattern, prefix: "A · ",
-                    dialer: entryGroup, automatic: profile.groupAAutoTest
-                ),
-                providerB: provider(
-                    url: exitURL, key: providerB, pattern: groupBPattern, prefix: "B · ",
-                    dialer: entryGroup, automatic: profile.groupBAutoTest
-                ),
-            ],
-            "proxy-groups": [
-                group(entryGroup, provider: providerL, automatic: profile.entryAutoTest),
-                group(groupA, provider: providerA, automatic: profile.groupAAutoTest),
-                group(groupB, provider: providerB, automatic: profile.groupBAutoTest),
-            ],
-            "rules": rules(socialGroup: profile.socialUsesGroupB ? groupB : groupA),
+            "proxies": proxies,
+            "proxy-providers": providers,
+            "proxy-groups": proxyGroups,
+            "rules": builtRules.rules,
         ]
+        if useTun {
+            config["sniffer"] = [
+                "enable": true,
+                "parse-pure-ip": true,
+                "sniff": [
+                    "HTTP": [
+                        "ports": [80, "8080-8880"],
+                        "override-destination": true,
+                    ],
+                    "TLS": [
+                        "ports": [443, 8443],
+                    ],
+                    "QUIC": [
+                        "ports": [443, 8443],
+                    ],
+                ],
+            ]
+        }
+        if !builtRules.ruleProviders.isEmpty {
+            config["rule-providers"] = builtRules.ruleProviders
+        }
+
+        // 6. Merge enabled Host modules (e.g. Surge .sgmodule [Host] CNAME/IP mappings)
+        //    and custom DNS Host entries (exact or wildcard hosts; custom entries override module entries).
+        var mergedHosts: [String: Any] = [:]
+        for module in profile.hostModules where module.isEnabled {
+            for (rawHost, rawTarget) in module.cachedHosts {
+                let host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines)
+                let target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !host.isEmpty, !target.isEmpty,
+                      host.caseInsensitiveCompare(target) != .orderedSame,
+                      !host.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                      !target.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+                    continue
+                }
+                if target.contains(",") {
+                    let values = target.split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty && $0.caseInsensitiveCompare(host) != .orderedSame }
+                    if values.count > 1 {
+                        mergedHosts[host] = values
+                    } else if let only = values.first {
+                        mergedHosts[host] = only
+                    }
+                } else {
+                    mergedHosts[host] = target
+                }
+            }
+        }
+
+        // Validate & collect custom DNS entries (Host mappings, per-domain Server policies, and Fake-IP bypass patterns)
+        var customDNSPolicies: [(key: String, servers: [String])] = []
+        var customFakeIPFilters: [String] = []
+        for entry in profile.customDNS.entries where entry.isEnabled {
+            let pattern = entry.trimmedPattern
+            switch entry.kind {
+            case .host:
+                guard CustomDNSValidator.isValidPattern(pattern, allowPolicyPrefix: false) else {
+                    throw RoutingConfigurationError.invalidDNS("Host 域名或通配符「\(entry.pattern)」格式无效。")
+                }
+                let values = entry.splitValues
+                guard !values.isEmpty,
+                      values.allSatisfy({ CustomDNSValidator.isValidHostTarget($0, forPattern: pattern) }) else {
+                    throw RoutingConfigurationError.invalidDNS("Host「\(pattern)」的映射值无效，或与域名自身相同。")
+                }
+                if values.count > 1 {
+                    mergedHosts[pattern] = values
+                } else if let only = values.first {
+                    mergedHosts[pattern] = only
+                }
+            case .server:
+                guard CustomDNSValidator.isValidPattern(pattern, allowPolicyPrefix: true) else {
+                    throw RoutingConfigurationError.invalidDNS("DNS 策略域名或通配符「\(entry.pattern)」格式无效。")
+                }
+                let rawServers = entry.splitValues
+                guard !rawServers.isEmpty, rawServers.allSatisfy(CustomDNSValidator.isValidServer) else {
+                    throw RoutingConfigurationError.invalidDNS("域名「\(pattern)」的 DNS 服务器地址格式无效。")
+                }
+                let boundOutboundName: String?
+                if let targetID = entry.targetID {
+                    guard let resolved = outboundNameByTargetID[targetID] else {
+                        throw RoutingConfigurationError.invalidDNS("域名「\(pattern)」指定的解析出口目标不存在，请重新选择。")
+                    }
+                    boundOutboundName = resolved
+                } else {
+                    boundOutboundName = nil
+                }
+                let resolvedServers = rawServers.map { server -> String in
+                    if let outbound = boundOutboundName, !server.contains("#") {
+                        return "\(server)#\(outbound)"
+                    }
+                    return server
+                }
+                customDNSPolicies.append((key: pattern, servers: resolvedServers))
+                if entry.bypassFakeIP,
+                   !pattern.lowercased().hasPrefix("geosite:"),
+                   !pattern.lowercased().hasPrefix("rule-set:") {
+                    customFakeIPFilters.append(pattern)
+                }
+            }
+        }
+
+        let customDirectServers = profile.customDNS.directServers
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for server in customDirectServers where !CustomDNSValidator.isValidServer(server) {
+            throw RoutingConfigurationError.invalidDNS("自定义直连上游 DNS「\(server)」格式无效。")
+        }
+
+        let customBootstrapServers = profile.customDNS.bootstrapServers
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for server in customBootstrapServers where !CustomDNSValidator.isValidServer(server) {
+            throw RoutingConfigurationError.invalidDNS("自定义引导 DNS「\(server)」格式无效。")
+        }
+
+        if !mergedHosts.isEmpty {
+            config["hosts"] = mergedHosts
+        }
+
+        // 7. Build anti-DNS-leak & interface-aware DNS configuration:
+        //    - Proxy-routed traffic resolves via its proxy group (`#<proxyGroup>`), never leaking to domestic DNS.
+        //    - Direct-routed traffic resolves via domestic DoH bound to its target interface (`#<interface>`).
+        //    - Proxy node domains stay isolated on `proxy-server-nameserver` with `respect-rules: false` (no loop).
+        //    - Subscription & direct rule-provider hosts are pinned to direct DNS in `nameserver-policy` so
+        //      `direct-nameserver-follow-policy: true` can never deadlock provider downloads through a proxy group.
+        var directBypassHosts: [String] = []
+        var seenBypassHosts = Set<String>()
+        func recordBypassHost(from rawURL: String) {
+            guard let host = URLComponents(string: rawURL)?.host?.lowercased(),
+                  !host.isEmpty,
+                  seenBypassHosts.insert(host).inserted else { return }
+            directBypassHosts.append(host)
+        }
+        for (_, providerEntry) in providers.sorted(by: { $0.key < $1.key }) {
+            if let rawURL = providerEntry["url"] as? String {
+                recordBypassHost(from: rawURL)
+            }
+        }
+        for (_, ruleProviderEntry) in builtRules.ruleProviders.sorted(by: { $0.key < $1.key }) {
+            if (ruleProviderEntry["proxy"] as? String) == "DIRECT",
+               let rawURL = ruleProviderEntry["url"] as? String {
+                recordBypassHost(from: rawURL)
+            }
+        }
+
+        config["dns"] = buildDNSConfig(
+            profile: profile,
+            activeTargetIDs: activeTargetIDs,
+            outboundNameByTargetID: outboundNameByTargetID,
+            targetByID: targetByID,
+            boundInterfaceByTargetID: boundInterfaceByTargetID,
+            dnsPolicies: builtRules.dnsPolicies,
+            customDNSPolicies: customDNSPolicies,
+            customFakeIPFilters: customFakeIPFilters,
+            customDirectServers: customDirectServers,
+            customBootstrapServers: customBootstrapServers,
+            directBypassHosts: directBypassHosts,
+            interfaceDNS: interfaceDNS
+        )
+
+        if let httpPort = profile.httpPort {
+            config["port"] = httpPort
+        }
+        if let socksPort = profile.socksPort {
+            config["socks-port"] = socksPort
+        }
 
         switch (controllerPort, secret) {
-        case (nil, nil): break
+        case (nil, nil):
+            break
         case let (.some(port), .some(key)):
-            guard (1024...65535).contains(port), port != profile.mixedPort else {
+            guard (1024...65535).contains(port), !usedPorts.contains(port) else {
                 throw RoutingConfigurationError.invalidPort("控制端口")
             }
             guard !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -134,17 +584,458 @@ public enum MihomoConfig {
             }
             config["external-controller"] = "127.0.0.1:\(port)"
             config["secret"] = key
-        default: throw RoutingConfigurationError.invalidController
+        default:
+            throw RoutingConfigurationError.invalidController
         }
 
-        return try JSONSerialization.data(
-            withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try JSONSerialization.data(
+            withJSONObject: config,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
+
+        var preloadResources: [PreloadResourceItem] = []
+        for (key, entry) in providers.sorted(by: { $0.key < $1.key }) {
+            if let url = entry["url"] as? String,
+               let relPath = entry["path"] as? String {
+                preloadResources.append(
+                    PreloadResourceItem(key: key, url: url, relativePath: relPath, kind: .proxyProvider)
+                )
+            }
+        }
+        for (key, entry) in builtRules.ruleProviders.sorted(by: { $0.key < $1.key }) {
+            if let url = entry["url"] as? String,
+               let relPath = entry["path"] as? String {
+                preloadResources.append(
+                    PreloadResourceItem(key: key, url: url, relativePath: relPath, kind: .ruleProvider)
+                )
+            }
+        }
+
+        return RenderedMihomoConfig(
+            data: data,
+            activeProxyGroupNames: activeProxyGroupNames,
+            requiredInterfaces: requiredInterfaces.sorted(),
+            tunEnabled: useTun,
+            gatewayModeEnabled: gatewayEnabled,
+            preloadResources: preloadResources
+        )
+    }
+
+    private struct BuiltRulesResult {
+        let rules: [String]
+        let ruleProviders: [String: [String: Any]]
+        let hasProcessRule: Bool
+        let dnsPolicies: [(key: String, servers: [String])]
+    }
+
+    private static func bootstrapDNS(
+        interface: String?,
+        interfaceDNS: [String: [String]],
+        avoidSystemDNS: Bool = false
+    ) -> [String] {
+        var result: [String] = []
+        if let interface, let discovered = interfaceDNS[interface], !discovered.isEmpty {
+            for ip in discovered where !result.contains(ip) {
+                result.append(ip)
+            }
+        } else if !avoidSystemDNS {
+            result.append("system")
+        }
+        for fallback in ["223.5.5.5", "119.29.29.29"] where !result.contains(fallback) {
+            result.append(fallback)
+        }
+        return result
+    }
+
+    /// Resolves DNS for a direct target:
+    /// - When bound to a specific interface (e.g. USB eSIM `en10`), binds DNS strictly through the direct
+    ///   target outbound (`#<outboundName>`) using discovered interface DNS + DoH, avoiding Mihomo's
+    ///   `dhcp://<iface>` broadcast which fails with `sendto: no route to host` on macOS.
+    /// - When unbound, uses system + reliable IP fallbacks (or omits `system` in TUN mode where macOS
+    ///   system DNS is hijacked to `198.18.0.2` to prevent a self-lookup loop).
+    private static func directTargetDNS(
+        outboundName: String?,
+        interface: String?,
+        interfaceDNS: [String: [String]],
+        customDirectServers: [String] = [],
+        avoidSystemDNS: Bool = false
+    ) -> [String] {
+        if !customDirectServers.isEmpty {
+            if let interface, !interface.isEmpty, let outboundName {
+                return customDirectServers.map { server in
+                    server.contains("#") ? server : "\(server)#\(outboundName)"
+                }
+            }
+            return customDirectServers
+        }
+        guard let interface else {
+            return avoidSystemDNS ? ["223.5.5.5", "119.29.29.29"] : ["system", "223.5.5.5", "119.29.29.29"]
+        }
+        if let outboundName {
+            if let discovered = interfaceDNS[interface], !discovered.isEmpty {
+                var servers: [String] = []
+                for ip in discovered {
+                    let entry = "\(ip)#\(outboundName)"
+                    if !servers.contains(entry) {
+                        servers.append(entry)
+                    }
+                }
+                return servers
+            }
+            return [
+                "https://1.1.1.1/dns-query#\(outboundName)",
+                "https://8.8.8.8/dns-query#\(outboundName)",
+            ]
+        }
+        return bootstrapDNS(interface: interface, interfaceDNS: interfaceDNS, avoidSystemDNS: avoidSystemDNS)
+    }
+
+    private static func proxyDoH(group: String) -> [String] {
+        [
+            "https://1.1.1.1/dns-query#\(group)",
+            "https://8.8.8.8/dns-query#\(group)",
+        ]
+    }
+
+    private static func buildDNSConfig(
+        profile: RoutingProfile,
+        activeTargetIDs: Set<UUID>,
+        outboundNameByTargetID: [UUID: String],
+        targetByID: [UUID: NetworkTarget],
+        boundInterfaceByTargetID: [UUID: String],
+        dnsPolicies: [(key: String, servers: [String])],
+        customDNSPolicies: [(key: String, servers: [String])],
+        customFakeIPFilters: [String],
+        customDirectServers: [String],
+        customBootstrapServers: [String],
+        directBypassHosts: [String],
+        interfaceDNS: [String: [String]]
+    ) -> [String: Any] {
+        let useTun = profile.effectiveTunEnabled
+        let activeTargets = profile.targets.filter { activeTargetIDs.contains($0.id) }
+
+        // If every active target binds the exact same interface (e.g. USB-only en10),
+        // prefer that interface's discovered DNS; otherwise use system + IP fallbacks.
+        let allTargetInterfaces = Set(activeTargets.map { boundInterfaceByTargetID[$0.id] ?? "" })
+        let sharedBootstrapInterface: String? = (allTargetInterfaces.count == 1 && allTargetInterfaces.first != "")
+            ? allTargetInterfaces.first
+            : nil
+
+        // If all active proxy targets share a single first-hop bound interface, prefer its discovered DNS.
+        let activeProxyTargets = activeTargets.filter { $0.mode == .proxy }
+        let proxyInterfaces = Set(activeProxyTargets.map { boundInterfaceByTargetID[$0.id] ?? "" })
+        let sharedProxyInterface: String? = (proxyInterfaces.count == 1 && proxyInterfaces.first != "")
+            ? proxyInterfaces.first
+            : nil
+
+        // Choose default direct-nameserver target/interface:
+        // - If MATCH is a direct target, follow its target outbound & interface.
+        // - Otherwise, only bind a specific interface when ALL active direct targets share that same interface.
+        let primaryDirectTarget: (name: String?, interface: String?) = {
+            if case .target(let id) = profile.fallbackTarget,
+               targetByID[id]?.mode == .direct {
+                return (outboundNameByTargetID[id], boundInterfaceByTargetID[id])
+            }
+            let activeDirectTargets = activeTargets.filter { $0.mode == .direct }
+            let directInterfaces = Set(activeDirectTargets.map { boundInterfaceByTargetID[$0.id] ?? "" })
+            if directInterfaces.count == 1, let only = directInterfaces.first, !only.isEmpty {
+                let firstTargetName = activeDirectTargets.first.flatMap { outboundNameByTargetID[$0.id] }
+                return (firstTargetName, only)
+            }
+            return (nil, nil)
+        }()
+
+        // Default nameserver follows the fallback (MATCH) target to prevent DNS leaks:
+        // - If MATCH goes to a proxy group P: default nameserver queries overseas DoH via `#P`.
+        // - If MATCH goes to direct target D (or REJECT): default nameserver uses D's interface-bound DNS or system.
+        let defaultNameserver: [String] = {
+            if case .target(let id) = profile.fallbackTarget,
+               let target = targetByID[id] {
+                switch target.mode {
+                case .proxy:
+                    if let name = outboundNameByTargetID[id] {
+                        return proxyDoH(group: name)
+                    }
+                case .direct:
+                    return directTargetDNS(
+                        outboundName: outboundNameByTargetID[id],
+                        interface: boundInterfaceByTargetID[id],
+                        interfaceDNS: interfaceDNS,
+                        customDirectServers: customDirectServers,
+                        avoidSystemDNS: useTun
+                    )
+                }
+            }
+            return directTargetDNS(
+                outboundName: primaryDirectTarget.name,
+                interface: primaryDirectTarget.interface,
+                interfaceDNS: interfaceDNS,
+                customDirectServers: customDirectServers,
+                avoidSystemDNS: useTun
+            )
+        }()
+
+        let directNameserver = directTargetDNS(
+            outboundName: primaryDirectTarget.name,
+            interface: primaryDirectTarget.interface,
+            interfaceDNS: interfaceDNS,
+            customDirectServers: customDirectServers,
+            avoidSystemDNS: useTun
+        )
+
+        // Build nameserver-policy preserving priority order:
+        // 1. User-defined custom DNS server policies (highest priority; never omitted even if equal to defaultNameserver,
+        //    so specific custom overrides still win over broader rule-group policies).
+        // 2. Subscription & direct rule-provider bypass hosts (prevent circular deadlock on startup).
+        // 3. Rule-group derived DNS policies (omit redundant entries matching defaultNameserver).
+        var policyMap: [String: [String]] = [:]
+        var seenPolicyKeys = Set<String>()
+        for entry in customDNSPolicies {
+            guard seenPolicyKeys.insert(entry.key).inserted else { continue }
+            policyMap[entry.key] = entry.servers
+        }
+        for host in directBypassHosts {
+            guard seenPolicyKeys.insert(host).inserted else { continue }
+            if directNameserver != defaultNameserver {
+                policyMap[host] = directNameserver
+            }
+        }
+        for entry in dnsPolicies {
+            guard seenPolicyKeys.insert(entry.key).inserted else { continue }
+            if entry.servers != defaultNameserver {
+                policyMap[entry.key] = entry.servers
+            }
+        }
+
+        let resolvedDefaultBootstrap = customBootstrapServers.isEmpty
+            ? bootstrapDNS(interface: sharedBootstrapInterface, interfaceDNS: interfaceDNS, avoidSystemDNS: useTun)
+            : customBootstrapServers
+        let resolvedProxyBootstrap = customBootstrapServers.isEmpty
+            ? bootstrapDNS(interface: sharedProxyInterface, interfaceDNS: interfaceDNS, avoidSystemDNS: useTun)
+            : customBootstrapServers
+
+        let enhancedMode = useTun ? profile.tunDNSMode.rawValue : "redir-host"
+        var dnsConfig: [String: Any] = [
+            "enable": true,
+            "ipv6": true,
+            "cache-algorithm": "arc",
+            "use-hosts": true,
+            "use-system-hosts": true,
+            "enhanced-mode": enhancedMode,
+            "respect-rules": false,
+            "default-nameserver": resolvedDefaultBootstrap,
+            "proxy-server-nameserver": resolvedProxyBootstrap,
+            "direct-nameserver": directNameserver,
+            "direct-nameserver-follow-policy": true,
+            "nameserver": defaultNameserver,
+        ]
+        if profile.gatewayModeEnabled {
+            dnsConfig["listen"] = "0.0.0.0:53"
+        }
+        if useTun && profile.tunDNSMode == .fakeIP {
+            dnsConfig["fake-ip-range"] = defaultFakeIPRange
+            var fakeIPFilter = defaultFakeIPFilter
+            for pattern in customFakeIPFilters where !fakeIPFilter.contains(pattern) {
+                fakeIPFilter.append(pattern)
+            }
+            dnsConfig["fake-ip-filter"] = fakeIPFilter
+        }
+        if !policyMap.isEmpty {
+            dnsConfig["nameserver-policy"] = policyMap
+        }
+        return dnsConfig
+    }
+
+    private static func buildRules(
+        profile: RoutingProfile,
+        outboundNameByTargetID: [UUID: String],
+        targetByID: [UUID: NetworkTarget],
+        boundInterfaceByTargetID: [UUID: String],
+        preferredProxyGroupName: String?,
+        interfaceDNS: [String: [String]]
+    ) throws -> BuiltRulesResult {
+        var result: [String] = []
+        var ruleProviders: [String: [String: Any]] = [:]
+        var hasProcessRule = false
+        var dnsPolicies: [(key: String, servers: [String])] = []
+
+        for group in profile.ruleGroups where group.isEnabled {
+            let enabledRules = group.rules.filter(\.isEnabled)
+            guard !enabledRules.isEmpty else { continue }
+
+            let targetName: String
+            let groupDNSServers: [String]?
+            switch group.target {
+            case .reject:
+                targetName = "REJECT"
+                groupDNSServers = nil
+            case .target(let id):
+                guard let resolved = outboundNameByTargetID[id], let target = targetByID[id] else {
+                    throw RoutingConfigurationError.invalidTarget("规则组「\(group.name)」指向的网络目标不存在。")
+                }
+                targetName = resolved
+                switch target.mode {
+                case .proxy:
+                    groupDNSServers = proxyDoH(group: resolved)
+                case .direct:
+                    let customDirect = profile.customDNS.directServers
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    groupDNSServers = directTargetDNS(
+                        outboundName: resolved,
+                        interface: boundInterfaceByTargetID[id],
+                        interfaceDNS: interfaceDNS,
+                        customDirectServers: customDirect,
+                        avoidSystemDNS: profile.effectiveTunEnabled
+                    )
+                }
+            }
+
+            for rule in enabledRules {
+                let value = rule.value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if rule.type == .ruleSet {
+                    let cleanURL = try checkedURL(value, field: "规则组「\(group.name)」远程规则集")
+                    let resolved = try RuleSetResolver.resolve(
+                        url: cleanURL,
+                        format: rule.ruleSetFormat,
+                        behavior: rule.ruleSetBehavior
+                    )
+                    let providerProxy = try resolveRuleProviderProxy(
+                        url: cleanURL,
+                        mode: profile.ruleProviderProxyMode,
+                        outboundNameByTargetID: outboundNameByTargetID,
+                        preferredProxyGroupName: preferredProxyGroupName
+                    )
+                    let key = Self.ruleSetProviderKey(for: cleanURL)
+                    if ruleProviders[key] == nil {
+                        ruleProviders[key] = [
+                            "type": "http",
+                            "behavior": resolved.behavior,
+                            "format": resolved.format,
+                            "url": cleanURL,
+                            "path": "./rulesets-cache/\(key).\(resolved.fileExt)",
+                            "interval": max(1, profile.ruleSetUpdateIntervalHours) * 3_600,
+                            "proxy": providerProxy,
+                            "size-limit": 5_242_880,
+                        ]
+                    }
+                    // Mihomo nameserver-policy supports domain & classical rule-sets, but rejects ipcidr.
+                    if let servers = groupDNSServers, resolved.behavior != "ipcidr" {
+                        dnsPolicies.append(("rule-set:\(key)", servers))
+                    }
+                    if rule.ruleSetNoResolve == true {
+                        result.append("RULE-SET,\(key),\(targetName),no-resolve")
+                    } else {
+                        result.append("RULE-SET,\(key),\(targetName)")
+                    }
+                    continue
+                }
+
+                guard !value.isEmpty,
+                      !value.contains(","),
+                      !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+                    throw RoutingConfigurationError.invalidRule("规则组「\(group.name)」中存在空值或含逗号/控制字符的规则。")
+                }
+                if !rule.type.allowsSpaces,
+                   value.unicodeScalars.contains(where: CharacterSet.whitespacesAndNewlines.contains) {
+                    throw RoutingConfigurationError.invalidRule("规则组「\(group.name)」的 \(rule.type.rawValue) 规则不能包含空白字符。")
+                }
+                if rule.type == .dstPort {
+                    guard let port = Int(value), (1...65535).contains(port) else {
+                        throw RoutingConfigurationError.invalidRule("DST-PORT 必须为 1–65535 的整数。")
+                    }
+                }
+                if rule.type.isProcessRule {
+                    hasProcessRule = true
+                }
+                if let servers = groupDNSServers {
+                    switch rule.type {
+                    case .domain:
+                        if value.lowercased() != "localhost" {
+                            dnsPolicies.append((value, servers))
+                        }
+                    case .domainSuffix:
+                        let cleanSuffix = value.hasPrefix(".") ? String(value.dropFirst()) : value
+                        if !cleanSuffix.isEmpty {
+                            dnsPolicies.append(("+.\(cleanSuffix)", servers))
+                        }
+                    case .geosite:
+                        dnsPolicies.append(("geosite:\(value)", servers))
+                    default:
+                        break
+                    }
+                }
+                result.append(rule.formatted(target: targetName))
+            }
+        }
+
+        let fallbackName: String
+        switch profile.fallbackTarget {
+        case .reject:
+            fallbackName = "REJECT"
+        case .target(let id):
+            guard let resolved = outboundNameByTargetID[id] else {
+                throw RoutingConfigurationError.invalidTarget("默认兜底目标不存在。")
+            }
+            fallbackName = resolved
+        }
+        result.append("MATCH,\(fallbackName)")
+        return BuiltRulesResult(
+            rules: result,
+            ruleProviders: ruleProviders,
+            hasProcessRule: hasProcessRule,
+            dnsPolicies: dnsPolicies
+        )
+    }
+
+    private static let githubHosts: Set<String> = [
+        "raw.githubusercontent.com",
+        "github.com",
+        "gist.githubusercontent.com",
+        "objects.githubusercontent.com",
+    ]
+
+    private static func resolveRuleProviderProxy(
+        url: String,
+        mode: RuleProviderProxyMode,
+        outboundNameByTargetID: [UUID: String],
+        preferredProxyGroupName: String?
+    ) throws -> String {
+        switch mode {
+        case .direct:
+            return "DIRECT"
+        case .target(let id):
+            guard let name = outboundNameByTargetID[id] else {
+                throw RoutingConfigurationError.invalidTarget("规则集下载指定的网络目标不存在，请重新选择。")
+            }
+            return name
+        case .auto:
+            let host = URLComponents(string: url)?.host?.lowercased() ?? ""
+            if githubHosts.contains(host), let proxyGroup = preferredProxyGroupName {
+                return proxyGroup
+            }
+            return "DIRECT"
+        }
+    }
+
+    private static let reservedTargetNames: Set<String> = [
+        "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL",
+    ]
+
+    private static func checkedTargetName(_ raw: String) throws -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty,
+              !value.contains(","),
+              !value.contains("/"),
+              !reservedTargetNames.contains(value.uppercased()),
+              !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            throw RoutingConfigurationError.invalidTarget("目标名称不能为空，不能包含逗号、斜杠，且不能使用 Mihomo 保留名称（DIRECT、REJECT、REJECT-DROP、PASS、COMPATIBLE、GLOBAL）。")
+        }
+        return value
     }
 
     private static func checkedInterface(_ raw: String, field: String) throws -> String {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Darwin interface names fit IFNAMSIZ (16 bytes including the terminator).
         guard let range = value.range(of: #"^[A-Za-z][A-Za-z0-9_.-]{0,14}$"#, options: .regularExpression),
               range == value.startIndex..<value.endIndex, value != "lo0", !value.hasPrefix("utun") else {
             throw RoutingConfigurationError.invalidInterface(field)
@@ -175,92 +1066,90 @@ public enum MihomoConfig {
         return pattern
     }
 
-    private static func direct(_ name: String, interface: String) -> [String: Any] {
-        ["name": name, "type": "direct", "udp": true, "interface-name": interface]
+    private static func directProxy(_ name: String, interface: String?) -> [String: Any] {
+        var entry: [String: Any] = ["name": name, "type": "direct", "udp": true]
+        if let interface {
+            entry["interface-name"] = interface
+        }
+        return entry
     }
 
     private static func provider(
-        url: String, key: String, pattern: String, prefix: String, dialer: String,
-        interface: String? = nil, automatic: Bool
+        url: String, key: String, pattern: String, excludePattern: String, prefix: String, dialer: String, interface: String? = nil
     ) -> [String: Any] {
-        var override = ["dialer-proxy": dialer, "additional-prefix": prefix]
-        if let interface { override["interface-name"] = interface }
+        var override: [String: String] = ["dialer-proxy": dialer]
+        if !prefix.isEmpty {
+            override["additional-prefix"] = prefix
+        }
+        if let interface {
+            override["interface-name"] = interface
+        }
         var data: [String: Any] = [
             "type": "http",
             "url": url,
-            "path": "./providers/\(key)-\(cacheIdentifier(url, pattern)).yaml",
+            "path": "./providers-cache/\(key)-\(shortHash(url + "\u{0}" + pattern + "\u{0}" + excludePattern)).yaml",
             "interval": 3600,
-            "proxy": domesticOutbound,
+            "proxy": "DIRECT",
             "size-limit": 5_242_880,
             "exclude-type": "direct|reject|reject-drop|pass|compatible",
             "override": override,
             "health-check": [
-                "enable": automatic,
+                "enable": false,
                 "url": healthCheckURL,
                 "interval": 300,
                 "timeout": 5_000,
-                "lazy": false,
+                "lazy": true,
                 "expected-status": "204",
             ],
         ]
-        if !pattern.isEmpty { data["filter"] = pattern }
+        if !pattern.isEmpty {
+            data["filter"] = pattern
+        }
+        if !excludePattern.isEmpty {
+            data["exclude-filter"] = excludePattern
+        }
         return data
     }
 
-    // The stable, private cache key partitions different subscriptions and regex edits.
-    // This is a non-secret identifier, not a credential hash or an authorization boundary.
-    private static func cacheIdentifier(_ url: String, _ pattern: String) -> String {
+    public static func ruleSetProviderKey(for url: String) -> String {
+        "rs-\(shortHash(url.trimmingCharacters(in: .whitespacesAndNewlines)))"
+    }
+
+    private static func shortHash(_ input: String) -> String {
         var hash: UInt64 = 0xcbf29ce484222325
-        for byte in (url + "\u{0}" + pattern).utf8 {
+        for byte in input.utf8 {
             hash = (hash ^ UInt64(byte)) &* 0x100000001b3
         }
         return String(hash, radix: 16)
     }
 
-    private static func group(_ name: String, provider: String, automatic: Bool) -> [String: Any] {
+    private static func proxyGroup(
+        _ name: String,
+        provider: String,
+        pattern: String,
+        excludePattern: String,
+        automatic: Bool,
+        tolerance: Int = 50
+    ) -> [String: Any] {
         var data: [String: Any] = [
             "name": name,
             "type": automatic ? "url-test" : "select",
             "use": [provider],
             "empty-fallback": "REJECT",
         ]
+        if !pattern.isEmpty {
+            data["filter"] = pattern
+        }
+        if !excludePattern.isEmpty {
+            data["exclude-filter"] = excludePattern
+        }
         if automatic {
             data["url"] = healthCheckURL
             data["interval"] = 300
-            data["tolerance"] = 50
-            data["lazy"] = false
+            data["tolerance"] = tolerance
+            data["lazy"] = true
             data["expected-status"] = "204"
         }
         return data
-    }
-
-    private static func rules(socialGroup: String) -> [String] {
-        let claude = [
-            "claude.ai", "claude.com", "anthropic.com", "anthropic.ai",
-            "claudeusercontent.com",
-        ]
-        let social = [
-            "x.com", "twitter.com", "t.co", "twimg.com",
-            "facebook.com", "facebook.net", "fbcdn.net", "fb.com", "messenger.com", "m.me",
-            "instagram.com", "cdninstagram.com", "threads.net", "threads.com",
-            "whatsapp.com", "whatsapp.net", "wa.me",
-            "telegram.org", "telegram.me", "t.me", "telegra.ph", "telesco.pe",
-            "reddit.com", "redd.it", "redditmedia.com", "redditstatic.com",
-            "discord.com", "discord.gg", "discordapp.com", "discordapp.net",
-            "linkedin.com", "licdn.com", "tiktok.com", "tiktokcdn.com", "tiktokv.com", "byteoversea.com",
-            "bsky.app", "bsky.network", "bsky.social",
-        ]
-        let local = [
-            "IP-CIDR,127.0.0.0/8", "IP-CIDR,10.0.0.0/8", "IP-CIDR,172.16.0.0/12",
-            "IP-CIDR,192.168.0.0/16", "IP-CIDR,169.254.0.0/16", "IP-CIDR6,::1/128",
-            "IP-CIDR6,fc00::/7", "IP-CIDR6,fe80::/10",
-        ]
-        return claude.map { "DOMAIN-SUFFIX,\($0),\(claudeOutbound)" }
-            + ["GEOSITE,google,\(groupA)", "GEOSITE,youtube,\(groupA)"]
-            + social.map { "DOMAIN-SUFFIX,\($0),\(socialGroup)" }
-            + ["DOMAIN,localhost,\(domesticOutbound)", "DOMAIN-SUFFIX,local,\(domesticOutbound)"]
-            + local.map { "\($0),\(domesticOutbound),no-resolve" }
-            + ["GEOSITE,cn,\(domesticOutbound)", "DOMAIN-SUFFIX,cn,\(domesticOutbound)",
-               "GEOIP,CN,\(domesticOutbound)", "MATCH,\(groupB)"]
     }
 }

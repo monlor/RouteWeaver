@@ -8,7 +8,9 @@ var targets: [Target] = [
 ]
 #if os(macOS)
 products.append(.executable(name: "RouteWeaver", targets: ["RouteWeaver"]))
+products.append(.executable(name: "RouteWeaverTunHelper", targets: ["RouteWeaverTunHelper"]))
 targets.append(.executableTarget(name: "RouteWeaver", dependencies: ["RoutingCore"]))
+targets.append(.executableTarget(name: "RouteWeaverTunHelper"))
 #endif
 
 let package = Package(
