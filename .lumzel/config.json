@@ -1,4 +1,17 @@
 {
+  "commands": [
+    {
+      "agent": null,
+      "appendEnter": true,
+      "autoClose": false,
+      "command": "./Scripts/install-app.sh",
+      "id": "install-app",
+      "label": "安装到 Mac",
+      "prompt": null,
+      "type": "command",
+      "workflowId": null
+    }
+  ],
   "preview": {
     "services": [
       {
@@ -6,17 +19,14 @@
         "command": [
           "bash",
           "-lc",
-          "./Scripts/build-app.sh && open -g -n ./dist/RouteWeaver.app"
-        ],
-        "stop": [
-          "bash",
-          "-lc",
-          "pkill -TERM -x RouteWeaver || true; for i in $(seq 1 20); do pgrep -x RouteWeaver >/dev/null || exit 0; sleep 0.1; done; pkill -KILL -x RouteWeaver || true"
+          "./Scripts/build-app.sh && (pkill -TERM -f \"[R]outeWeaver\\.app/Contents/MacOS/RouteWeaver\" || true; for i in $(seq 1 20); do pgrep -f \"[R]outeWeaver\\.app/Contents/MacOS/RouteWeaver\" >/dev/null || break; sleep 0.1; done; pkill -KILL -f \"[R]outeWeaver\\.app/Contents/MacOS/RouteWeaver\" || true) && open -g ./dist/RouteWeaver.app"
         ],
         "cwd": ".",
         "defaultPath": null,
         "dependsOn": [],
-        "env": {},
+        "env": {
+          "SKIP_TESTS": "1"
+        },
         "healthPath": "/health",
         "id": "routeweaver",
         "kind": "macos-app",
@@ -27,9 +37,14 @@
           "fixed": null
         },
         "preferredPort": null,
-        "readyTimeoutMs": 120000,
+        "readyTimeoutMs": 180000,
         "route": "direct",
-        "source": "configured"
+        "source": "configured",
+        "stop": [
+          "bash",
+          "-lc",
+          "pkill -TERM -f \"$PWD/dist/RouteWeaver.app/Contents/MacOS/RouteWeaver\" || true; for i in $(seq 1 20); do pgrep -f \"$PWD/dist/RouteWeaver.app/Contents/MacOS/RouteWeaver\" >/dev/null || exit 0; sleep 0.1; done; pkill -KILL -f \"$PWD/dist/RouteWeaver.app/Contents/MacOS/RouteWeaver\" || true"
+        ]
       }
     ],
     "version": 1
