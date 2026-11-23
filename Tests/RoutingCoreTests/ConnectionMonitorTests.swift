@@ -480,4 +480,224 @@ final class ConnectionMonitorTests: XCTestCase {
         XCTAssertEqual(tracker.filtered(includeInner: false).map(\.id), ["biz-1"])
         XCTAssertEqual(tracker.filtered(includeInner: true).count, 2)
     }
+
+    func testPerTargetTrafficHistoryPersistenceRenameAndInnerExclusion() throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 0)!
+        let day1 = Date(timeIntervalSince1970: 1_795_000_000)
+        let day1T1 = day1.addingTimeInterval(2)
+        let day1Hour = cal.component(.hour, from: day1)
+        let day2 = cal.date(byAdding: .day, value: 1, to: day1)!
+
+        // 1. ConnectionTracker excludes Inner connections and retains totals past maxClosedHistory
+        var tracker = ConnectionTracker(maxClosedHistory: 10, maxSpeedSamples: 10)
+        var acc = TrafficHistoryAccumulator()
+
+        let bizHK = MihomoConnection(
+            id: "hk-1",
+            metadata: MihomoConnectionMetadata(type: "Tun", host: "hk.example.com"),
+            upload: 1_000,
+            download: 3_000,
+            start: "",
+            chains: ["HK-Node", "香港出口"],
+            rule: "MATCH",
+            rulePayload: ""
+        )
+        let innerHK = MihomoConnection(
+            id: "hk-inner",
+            metadata: MihomoConnectionMetadata(type: "Inner", host: "relay.example.com"),
+            upload: 1_100,
+            download: 3_200,
+            start: "",
+            chains: ["Relay-Node", "香港出口·链式"],
+            rule: "",
+            rulePayload: ""
+        )
+        tracker.ingest(
+            MihomoConnectionsSnapshot(downloadTotal: 3_000, uploadTotal: 1_000, connections: [bizHK, innerHK]),
+            at: day1
+        )
+        XCTAssertEqual(tracker.lastTargetDeltas.keys.sorted(), ["香港出口"])
+        XCTAssertEqual(tracker.lastTargetDeltas["香港出口"], TrafficBytes(upload: 1_000, download: 3_000))
+        acc.recordDelta(
+            uploadDelta: tracker.lastUploadDelta,
+            downloadDelta: tracker.lastDownloadDelta,
+            targetDeltas: tracker.lastTargetDeltas,
+            at: day1,
+            calendar: cal
+        )
+
+        // Second snapshot 2 seconds later: hk-1 grows, us-1 appears
+        let bizHK2 = MihomoConnection(
+            id: "hk-1",
+            metadata: MihomoConnectionMetadata(type: "Tun", host: "hk.example.com"),
+            upload: 1_400,
+            download: 5_000,
+            start: "",
+            chains: ["HK-Node", "香港出口"],
+            rule: "MATCH",
+            rulePayload: ""
+        )
+        let bizUS = MihomoConnection(
+            id: "us-1",
+            metadata: MihomoConnectionMetadata(type: "Tun", host: "us.example.com"),
+            upload: 200,
+            download: 800,
+            start: "",
+            chains: ["US-Node", "美国出口"],
+            rule: "MATCH",
+            rulePayload: ""
+        )
+        tracker.ingest(
+            MihomoConnectionsSnapshot(downloadTotal: 5_800, uploadTotal: 1_600, connections: [bizHK2, bizUS]),
+            at: day1T1
+        )
+        XCTAssertEqual(tracker.lastTargetDeltas["香港出口"], TrafficBytes(upload: 400, download: 2_000))
+        XCTAssertEqual(tracker.lastTargetDeltas["美国出口"], TrafficBytes(upload: 200, download: 800))
+        XCTAssertEqual(tracker.liveSpeed(for: "香港出口"), TrafficBytes(upload: 200, download: 1_000))
+        XCTAssertEqual(tracker.speedHistory(for: "香港出口").count, 2)
+        XCTAssertEqual(tracker.speedHistory(for: "香港出口").last?.downloadSpeed, 1_000)
+
+        acc.recordDelta(
+            uploadDelta: tracker.lastUploadDelta,
+            downloadDelta: tracker.lastDownloadDelta,
+            targetDeltas: tracker.lastTargetDeltas,
+            at: day1T1,
+            calendar: cal
+        )
+
+        // Even after clearing closed connections, session target totals remain intact
+        tracker.ingest(MihomoConnectionsSnapshot(downloadTotal: 5_800, uploadTotal: 1_600, connections: []), at: day1T1.addingTimeInterval(1))
+        tracker.clearClosed()
+        XCTAssertEqual(tracker.sessionTraffic(for: "香港出口"), TrafficBytes(upload: 1_400, download: 5_000))
+        XCTAssertEqual(tracker.targetTrafficStats.map(\.target), ["香港出口", "美国出口"])
+
+        // 2. Per-target queries on TrafficHistoryAccumulator
+        XCTAssertEqual(acc.todayRecord(target: "香港出口", at: day1, calendar: cal).total, 6_400)
+        XCTAssertEqual(acc.todayHourlyBuckets(target: "香港出口", at: day1, calendar: cal)[day1Hour].download, 5_000)
+        XCTAssertEqual(acc.todayRecord(target: "美国出口", at: day1, calendar: cal).total, 1_000)
+
+        // Day 2 traffic on US
+        acc.recordDelta(
+            uploadDelta: 500,
+            downloadDelta: 1_500,
+            targetDeltas: ["美国出口": TrafficBytes(upload: 500, download: 1_500)],
+            at: day2,
+            calendar: cal
+        )
+        let weekStats = acc.targetTrafficStats(lastNDays: 7, at: day2, calendar: cal)
+        XCTAssertEqual(weekStats.count, 2)
+        XCTAssertEqual(weekStats[0].target, "香港出口")
+        XCTAssertEqual(weekStats[0].total, 6_400)
+        XCTAssertEqual(weekStats[1].target, "美国出口")
+        XCTAssertEqual(weekStats[1].total, 3_000)
+
+        // 3. Rename target migrates daily and hourly buckets
+        acc.renameTarget(from: "香港出口", to: "香港专线")
+        XCTAssertEqual(acc.totalBytes(lastNDays: 7, target: "香港出口", at: day2, calendar: cal).download, 0)
+        XCTAssertEqual(acc.totalBytes(lastNDays: 7, target: "香港专线", at: day2, calendar: cal).download, 5_000)
+
+        // 4. Backward compatibility decoding legacy JSON without `byTarget`
+        let legacyJSON = """
+        {
+          "dailyRecords": {
+            "2026-11-22": { "dayKey": "2026-11-22", "upload": 123, "download": 456 }
+          },
+          "hourlyDayKey": "2026-11-22",
+          "hourlyBuckets": {
+            "10": { "hour": 10, "upload": 123, "download": 456 }
+          }
+        }
+        """
+        let decodedLegacy = try JSONDecoder().decode(TrafficHistoryAccumulator.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(decodedLegacy.dailyRecords["2026-11-22"]?.download, 456)
+        XCTAssertEqual(decodedLegacy.dailyRecords["2026-11-22"]?.byTarget, [:])
+        XCTAssertEqual(decodedLegacy.hourlyBuckets[10]?.byTarget, [:])
+    }
+
+    func testDNSLogTrackerFilteringCountingAndRingLimit() {
+        var tracker = DNSLogTracker(maxRecords: 3)
+        let ok = DNSLogRecord(
+            domain: "apple.com",
+            recordType: "A",
+            answers: ["17.253.144.10"],
+            upstream: "https://dns.google/dns-query",
+            status: .resolved,
+            rawPayload: "apple.com"
+        )
+        let cached = DNSLogRecord(
+            domain: "cache.example.com",
+            recordType: "A",
+            answers: ["1.2.3.4"],
+            upstream: "cache",
+            cacheExpireAt: "12:00:00",
+            status: .resolved,
+            rawPayload: "cache.example.com"
+        )
+        let emptyAAAA = DNSLogRecord(
+            domain: "ipv4only.example.com",
+            recordType: "AAAA",
+            answers: [],
+            upstream: "https://1.1.1.1/dns-query",
+            status: .resolved,
+            rawPayload: "ipv4only"
+        )
+        let failed = DNSLogRecord(
+            domain: "broken.test",
+            recordType: "A",
+            answers: [],
+            upstream: "DNS Server",
+            status: .failed,
+            errorMessage: "i/o timeout",
+            rawPayload: "broken.test failed"
+        )
+
+        tracker.appendBatch([ok, cached, emptyAAAA, failed])
+        XCTAssertEqual(tracker.records.count, 3)
+        XCTAssertEqual(tracker.records.first?.domain, "broken.test")
+        XCTAssertEqual(tracker.failedCount, 1)
+        XCTAssertEqual(tracker.cacheHitCount, 1)
+
+        XCTAssertEqual(tracker.filtered(scope: .failed).map(\.domain), ["broken.test"])
+        XCTAssertEqual(tracker.filtered(sourceFilter: .cache).map(\.domain), ["cache.example.com"])
+        XCTAssertEqual(tracker.filtered(hideEmptyAnswers: true).map(\.domain), ["broken.test", "cache.example.com"])
+        XCTAssertEqual(tracker.filtered(searchText: "timeout").map(\.domain), ["broken.test"])
+    }
+
+    func testRelayChainResolverUsesMihomoConfigNaming() throws {
+        let exitGroup = NodeGroup(name: "US", kind: .exit)
+        let relayGroup = NodeGroup(name: "HK", kind: .relay)
+        let chainedTarget = NetworkTarget(name: "Claude出口", mode: .proxy, exitGroupID: exitGroup.id, relayGroupID: relayGroup.id)
+        let profile = RoutingProfile(nodeGroups: [exitGroup, relayGroup], targets: [chainedTarget])
+
+        var tracker = ConnectionTracker()
+        tracker.ingest(
+            MihomoConnectionsSnapshot(
+                downloadTotal: 200,
+                uploadTotal: 100,
+                connections: [
+                    MihomoConnection(
+                        id: "c1",
+                        metadata: MihomoConnectionMetadata(type: "Tun", host: "claude.ai"),
+                        upload: 100,
+                        download: 200,
+                        start: "",
+                        chains: ["US-01", "Claude出口"],
+                        rule: "MATCH",
+                        rulePayload: ""
+                    )
+                ]
+            ),
+            at: Date()
+        )
+        let conn = try XCTUnwrap(tracker.recordsByID["c1"])
+        let expectedGroup = MihomoConfig.relayGroupName(for: "Claude出口")
+        let resolved = RelayChainResolver.resolve(
+            for: conn,
+            profile: profile,
+            runtimeCurrentNodes: [expectedGroup: "HK-Relay-01"],
+            runtimeSelections: [:]
+        )
+        XCTAssertEqual(resolved, ResolvedRelayChain(relayGroupName: expectedGroup, relayNode: "HK-Relay-01"))
+    }
 }

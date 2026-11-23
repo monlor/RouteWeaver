@@ -67,10 +67,11 @@ final class RoutingCoreTests: XCTestCase {
         XCTAssertEqual(rendered.requiredInterfaces, ["en0", "en5"])
         XCTAssertEqual(Set(rendered.activeProxyGroupNames), Set(["香港", "香港·链式", "美国", "美国·链式"]))
 
-        // Verify url-test tuning: lazy=true, chained exit tolerance=100ms
+        // Verify url-test tuning: lazy=false (continuous background health/delay checks), interval=120s, chained exit tolerance=100ms
         let groups = try XCTUnwrap(config["proxy-groups"] as? [[String: Any]])
         let usGroupChained = try XCTUnwrap(groups.first { ($0["name"] as? String) == "美国" })
-        XCTAssertEqual(usGroupChained["lazy"] as? Bool, true)
+        XCTAssertEqual(usGroupChained["lazy"] as? Bool, false)
+        XCTAssertEqual(usGroupChained["interval"] as? Int, 120)
         XCTAssertEqual(usGroupChained["tolerance"] as? Int, 100)
 
         // Verify direct USB proxy
@@ -117,7 +118,8 @@ final class RoutingCoreTests: XCTestCase {
         XCTAssertEqual((usExitDirect["override"] as? [String: String])?["dialer-proxy"], "")
         XCTAssertEqual((usExitDirect["override"] as? [String: String])?["interface-name"], "en0")
         XCTAssertEqual(usGroupNoChain["filter"] as? String, "(?i)US|美国")
-        XCTAssertEqual(usGroupNoChain["lazy"] as? Bool, true)
+        XCTAssertEqual(usGroupNoChain["lazy"] as? Bool, false)
+        XCTAssertEqual(usGroupNoChain["interval"] as? Int, 120)
         XCTAssertEqual(usGroupNoChain["tolerance"] as? Int, 50)
     }
 
@@ -994,11 +996,36 @@ final class RoutingCoreTests: XCTestCase {
         // 4. Legacy v2 JSON without TUN fields decodes cleanly with safe defaults
         let legacyJSON = #"{"schemaVersion":2,"name":"旧方案","mixedPort":7890,"allowLAN":false,"subscriptions":[],"nodeGroups":[],"targets":[],"ruleGroups":[],"fallbackTarget":{"kind":"reject"}}"#
         let decoded = try RoutingProfile.decodeOrMigrate(from: Data(legacyJSON.utf8))
+        XCTAssertFalse(decoded.ipv6Enabled)
         XCTAssertFalse(decoded.tunEnabled)
         XCTAssertFalse(decoded.gatewayModeEnabled)
         XCTAssertEqual(decoded.tunStack, .mixed)
         XCTAssertTrue(decoded.tunStrictRoute)
         XCTAssertEqual(decoded.tunDNSMode, .fakeIP)
+    }
+
+    func testIPv6ToggleControlsTopLevelAndDNSConfig() throws {
+        let direct = NetworkTarget(name: "直连", mode: .direct)
+        var profile = RoutingProfile(
+            name: "IPv6测试",
+            targets: [direct],
+            ruleGroups: [],
+            fallbackTarget: .target(direct.id)
+        )
+
+        // Default is disabled
+        XCTAssertFalse(profile.ipv6Enabled)
+        let disabledConfig = try decodeJSON(try MihomoConfig.render(profile))
+        XCTAssertEqual(disabledConfig["ipv6"] as? Bool, false)
+        let disabledDNS = try XCTUnwrap(disabledConfig["dns"] as? [String: Any])
+        XCTAssertEqual(disabledDNS["ipv6"] as? Bool, false)
+
+        // When enabled, both top-level ipv6 and dns.ipv6 become true
+        profile.ipv6Enabled = true
+        let enabledConfig = try decodeJSON(try MihomoConfig.render(profile))
+        XCTAssertEqual(enabledConfig["ipv6"] as? Bool, true)
+        let enabledDNS = try XCTUnwrap(enabledConfig["dns"] as? [String: Any])
+        XCTAssertEqual(enabledDNS["ipv6"] as? Bool, true)
     }
 
     func testGatewayModeEnablesTunAllowLANAndDNSListen53() throws {
@@ -1246,5 +1273,346 @@ final class RoutingCoreTests: XCTestCase {
         let legacyProfileJSON = #"{"schemaVersion":2,"name":"旧方案","mixedPort":7890,"targets":[],"ruleGroups":[]}"#
         let decoded = try JSONDecoder().decode(RoutingProfile.self, from: Data(legacyProfileJSON.utf8))
         XCTAssertTrue(decoded.customDNS.isEmpty)
+    }
+
+    func testCustomDNSSwappedHostDetectionIPFirstEqualsParsingAndValidation() throws {
+        // 1. Validator rejects IP as pattern and wildcard as host target
+        XCTAssertFalse(CustomDNSValidator.isValidPattern("192.168.100.2"))
+        XCTAssertFalse(CustomDNSValidator.isValidPattern("2001:db8::1"))
+        XCTAssertFalse(CustomDNSValidator.isValidHostTarget("*.monlor.cn", forPattern: "nas.monlor.cn"))
+        XCTAssertFalse(CustomDNSValidator.isValidHostTarget("+.monlor.cn", forPattern: "nas.monlor.cn"))
+        XCTAssertFalse(CustomDNSValidator.isValidHostTarget(".monlor.cn", forPattern: "nas.monlor.cn"))
+        XCTAssertTrue(CustomDNSValidator.isValidPattern("*.monlor.cn"))
+        XCTAssertTrue(CustomDNSValidator.isValidHostTarget("192.168.100.2", forPattern: "*.monlor.cn"))
+
+        // 2. Bulk parser recognizes IP-first `=` syntax (`192.168.100.2 = *.monlor.cn`)
+        let ipFirstBulk = """
+        192.168.100.2 = *.monlor.cn
+        192.168.100.3 = pc.monlor.cn, mac.monlor.cn
+        """
+        let parsed = CustomDNSParser.parseBulk(ipFirstBulk)
+        XCTAssertEqual(parsed.count, 3)
+        XCTAssertEqual(parsed[0].pattern, "*.monlor.cn")
+        XCTAssertEqual(parsed[0].value, "192.168.100.2")
+        XCTAssertEqual(parsed[1].pattern, "pc.monlor.cn")
+        XCTAssertEqual(parsed[1].value, "192.168.100.3")
+        XCTAssertEqual(parsed[2].pattern, "mac.monlor.cn")
+        XCTAssertEqual(parsed[2].value, "192.168.100.3")
+
+        // 3. Swapped host entry detection and one-click fix helper
+        let swapped = CustomDNSEntry(pattern: "192.168.100.2", kind: .host, value: "*.monlor.cn")
+        XCTAssertTrue(swapped.isLikelySwappedHost)
+        let fixed = swapped.swappedHostEntries()
+        XCTAssertEqual(fixed.count, 1)
+        XCTAssertEqual(fixed[0].pattern, "*.monlor.cn")
+        XCTAssertEqual(fixed[0].value, "192.168.100.2")
+        XCTAssertFalse(fixed[0].isLikelySwappedHost)
+
+        // 4. MihomoConfig.render rejects swapped host with clear error
+        let direct = NetworkTarget(name: "直连", mode: .direct)
+        let badProfile = RoutingProfile(
+            customDNS: CustomDNSConfig(entries: [swapped]),
+            targets: [direct],
+            fallbackTarget: .target(direct.id)
+        )
+        XCTAssertThrowsError(try MihomoConfig.render(badProfile)) { error in
+            if case RoutingConfigurationError.invalidDNS(let detail) = error {
+                XCTAssertTrue(detail.contains("顺序填反"))
+            } else {
+                XCTFail("Expected invalidDNS, got \(error)")
+            }
+        }
+    }
+
+    func testKillSwitchPFRuleGenerationAndOrder() {
+        let withLAN = KillSwitchRules.renderPFConfig(allowLAN: true)
+        let withoutLAN = KillSwitchRules.renderPFConfig(allowLAN: false)
+
+        // Core allowlist rules and strict ordering: lo0 -> utun -> Mihomo dedicated GID -> block port 53 -> DHCP -> (optional LAN) -> drop all
+        let lo0Idx = withLAN.range(of: "pass quick on lo0 all")?.lowerBound
+        let utunIdx = withLAN.range(of: "utun0, utun1")?.lowerBound
+        let mihomoIdx = withLAN.range(of: "user 0 group \(KillSwitchRules.mihomoDedicatedGID)")?.lowerBound
+        let dnsBlockIdx = withLAN.range(of: "block drop out quick proto { tcp, udp } from any to any port 53")?.lowerBound
+        let dhcpIdx = withLAN.range(of: "from any port 68 to any port 67")?.lowerBound
+        let lanIdx = withLAN.range(of: "192.168.0.0/16")?.lowerBound
+        let dropAllIdx = withLAN.range(of: "block drop out quick all")?.lowerBound
+
+        XCTAssertNotNil(lo0Idx)
+        XCTAssertNotNil(utunIdx)
+        XCTAssertNotNil(mihomoIdx)
+        XCTAssertNotNil(dnsBlockIdx)
+        XCTAssertNotNil(dhcpIdx)
+        XCTAssertNotNil(lanIdx)
+        XCTAssertNotNil(dropAllIdx)
+
+        if let lo0Idx, let utunIdx, let mihomoIdx, let dnsBlockIdx, let dhcpIdx, let lanIdx, let dropAllIdx {
+            XCTAssertLessThan(lo0Idx, utunIdx)
+            XCTAssertLessThan(utunIdx, mihomoIdx)
+            XCTAssertLessThan(mihomoIdx, dnsBlockIdx)
+            XCTAssertLessThan(dnsBlockIdx, dhcpIdx)
+            XCTAssertLessThan(dhcpIdx, lanIdx)
+            XCTAssertLessThan(lanIdx, dropAllIdx)
+        }
+
+        // Without LAN: DHCP still allowed so NICs can acquire leases, but RFC1918 / link-local pass rules are omitted
+        XCTAssertTrue(withoutLAN.contains("from any port 68 to any port 67"))
+        XCTAssertTrue(withoutLAN.contains("from any port 546 to any port 547"))
+        XCTAssertFalse(withoutLAN.contains("192.168.0.0/16"))
+        XCTAssertFalse(withoutLAN.contains("fe80::/10"))
+        XCTAssertTrue(withoutLAN.contains("block drop out quick all"))
+
+        // Verify syntax against macOS /sbin/pfctl -vnf - when available
+        #if os(macOS)
+        let pfctlPath = "/sbin/pfctl"
+        if FileManager.default.isExecutableFile(atPath: pfctlPath) {
+            for rules in [withLAN, withoutLAN] {
+                let proc = Process()
+                let inPipe = Pipe()
+                let outPipe = Pipe()
+                proc.executableURL = URL(fileURLWithPath: pfctlPath)
+                proc.arguments = ["-vnf", "-"]
+                proc.standardInput = inPipe
+                proc.standardOutput = outPipe
+                proc.standardError = outPipe
+                try? proc.run()
+                inPipe.fileHandleForWriting.write(Data(rules.utf8))
+                try? inPipe.fileHandleForWriting.close()
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                XCTAssertEqual(
+                    proc.terminationStatus,
+                    0,
+                    "pfctl syntax validation failed: \(String(decoding: outData, as: UTF8.self))"
+                )
+            }
+        }
+        #endif
+    }
+
+    func testRoutingProfileReferentialIntegrityMutations() {
+        let sub = ProxySubscription(name: "SubA", url: "https://example.com/sub.yaml", role: .exit)
+        let exitGroup = NodeGroup(name: "HK", kind: .exit, subscriptionID: sub.id, filterPattern: "HK")
+        let relayGroup = NodeGroup(name: "Relay", kind: .relay, subscriptionID: sub.id, filterPattern: "US")
+        let targetA = NetworkTarget(name: "ProxyA", mode: .proxy, exitGroupID: exitGroup.id, relayGroupID: relayGroup.id)
+        let targetB = NetworkTarget(name: "Direct", mode: .direct)
+        let ruleGroup = RuleGroup(name: "Work", target: .target(targetA.id))
+        let dnsEntry = CustomDNSEntry(pattern: "corp.local", kind: .server, value: "10.0.0.53", targetID: targetA.id)
+        let swappedEntry = CustomDNSEntry(pattern: "192.168.1.10", kind: .host, value: "nas.local")
+
+        var profile = RoutingProfile(
+            allowLAN: false,
+            tunEnabled: false,
+            gatewayModeEnabled: false,
+            ruleProviderProxyMode: .target(targetA.id),
+            subscriptions: [sub],
+            customDNS: CustomDNSConfig(entries: [dnsEntry, swappedEntry]),
+            nodeGroups: [exitGroup, relayGroup],
+            targets: [targetA, targetB],
+            ruleGroups: [ruleGroup],
+            fallbackTarget: .target(targetA.id)
+        )
+
+        profile.setGatewayModeEnabled(true)
+        XCTAssertTrue(profile.tunEnabled)
+        XCTAssertTrue(profile.allowLAN)
+        profile.setTunEnabled(false)
+        XCTAssertFalse(profile.gatewayModeEnabled)
+
+        XCTAssertEqual(profile.removeRelay(fromTargetID: targetA.id), "ProxyA")
+        XCTAssertNil(profile.targets[0].relayGroupID)
+
+        XCTAssertEqual(profile.deleteSubscription(id: sub.id), sub.url)
+        XCTAssertTrue(profile.subscriptions.isEmpty)
+        XCTAssertTrue(profile.nodeGroups.allSatisfy { $0.subscriptionID == nil })
+
+        profile.deleteNodeGroup(id: exitGroup.id)
+        XCTAssertNil(profile.targets[0].exitGroupID)
+
+        profile.deleteTarget(id: targetA.id)
+        XCTAssertEqual(profile.ruleGroups[0].target, .target(targetB.id))
+        XCTAssertEqual(profile.fallbackTarget, .target(targetB.id))
+        XCTAssertEqual(profile.ruleProviderProxyMode, .auto)
+        XCTAssertNil(profile.customDNS.entries[0].targetID)
+
+        XCTAssertEqual(profile.fixSwappedCustomDNSHosts(), 1)
+        XCTAssertEqual(profile.customDNS.entries[1].pattern, "nas.local")
+        XCTAssertEqual(profile.customDNS.entries[1].value, "192.168.1.10")
+
+        let importResult = profile.importCustomDNSEntries([
+            CustomDNSEntry(pattern: "NAS.LOCAL", kind: .host, value: "192.168.1.20"),
+            CustomDNSEntry(pattern: "printer.local", kind: .host, value: "192.168.1.30"),
+        ])
+        XCTAssertEqual(importResult.added, 1)
+        XCTAssertEqual(importResult.updated, 1)
+        XCTAssertEqual(profile.customDNS.entries[1].value, "192.168.1.20")
+    }
+
+    func testAliasTargetResolvesProxyDirectChainsAndQuickSwitch() throws {
+        let sub = ProxySubscription(name: "SubSG", url: "https://example.com/sg.yaml", role: .exit)
+        let sgGroupA = NodeGroup(name: "SG-TAG", kind: .exit, subscriptionID: sub.id, filterPattern: "TAG")
+        let sgGroupB = NodeGroup(name: "SG-PQJC", kind: .exit, subscriptionID: sub.id, filterPattern: "PQJC")
+
+        let sgTAG = NetworkTarget(name: "新加坡节点TAG", mode: .proxy, exitGroupID: sgGroupA.id)
+        let sgPQJC = NetworkTarget(name: "新加坡节点PQJC", mode: .proxy, exitGroupID: sgGroupB.id)
+        let sgESIM = NetworkTarget(name: "新加坡eSIM", mode: .direct, interfaceName: "en10")
+        let sgAlias = NetworkTarget(name: "新加坡主节点", mode: .alias, targetID: sgTAG.id)
+        let outerAlias = NetworkTarget(name: "外层别名", mode: .alias, targetID: sgAlias.id)
+
+        let googleGroup = RuleGroup(
+            name: "Google",
+            target: .target(outerAlias.id),
+            isEnabled: true,
+            rules: [RuleItem(type: .domainSuffix, value: "google.com")]
+        )
+
+        var profile = RoutingProfile(
+            subscriptions: [sub],
+            nodeGroups: [sgGroupA, sgGroupB],
+            targets: [sgTAG, sgPQJC, sgESIM, sgAlias, outerAlias],
+            ruleGroups: [googleGroup],
+            fallbackTarget: .target(sgAlias.id)
+        )
+
+        // 1. Multi-hop alias resolves to sgTAG
+        XCTAssertEqual(profile.resolvedLeafTarget(id: outerAlias.id)?.id, sgTAG.id)
+        XCTAssertEqual(profile.aliasReferrers(of: sgTAG.id).map(\.id), [sgAlias.id])
+        XCTAssertTrue(profile.requiredInterfaces.isEmpty)
+
+        let rendered1 = try MihomoConfig.renderDetailed(profile)
+        XCTAssertEqual(rendered1.activeProxyGroupNames, ["新加坡节点TAG"])
+        let json1 = try XCTUnwrap(JSONSerialization.jsonObject(with: rendered1.data) as? [String: Any])
+        let rules1 = try XCTUnwrap(json1["rules"] as? [String])
+        XCTAssertTrue(rules1.contains("DOMAIN-SUFFIX,google.com,新加坡节点TAG"))
+        XCTAssertTrue(rules1.contains("MATCH,新加坡节点TAG"))
+        let dns1 = try XCTUnwrap(json1["dns"] as? [String: Any])
+        let ns1 = try XCTUnwrap(dns1["nameserver"] as? [String])
+        XCTAssertTrue(ns1.allSatisfy { $0.hasSuffix("#新加坡节点TAG") })
+
+        // 2. Quick-switch alias from sgTAG to sgPQJC
+        let switched1 = profile.setAliasTarget(id: sgAlias.id, targetID: sgPQJC.id)
+        XCTAssertEqual(switched1?.sourceName, "新加坡主节点")
+        XCTAssertEqual(switched1?.targetName, "新加坡节点PQJC")
+
+        let rendered2 = try MihomoConfig.renderDetailed(profile)
+        XCTAssertEqual(rendered2.activeProxyGroupNames, ["新加坡节点PQJC"])
+        let json2 = try XCTUnwrap(JSONSerialization.jsonObject(with: rendered2.data) as? [String: Any])
+        let rules2 = try XCTUnwrap(json2["rules"] as? [String])
+        XCTAssertTrue(rules2.contains("DOMAIN-SUFFIX,google.com,新加坡节点PQJC"))
+        XCTAssertTrue(rules2.contains("MATCH,新加坡节点PQJC"))
+
+        // 3. Quick-switch alias to direct interface-bound target (sgESIM on en10)
+        _ = profile.setAliasTarget(id: sgAlias.id, targetID: sgESIM.id)
+        XCTAssertEqual(profile.requiredInterfaces, ["en10"])
+        let rendered3 = try MihomoConfig.renderDetailed(profile, interfaceDNS: ["en10": ["1.1.1.1"]])
+        XCTAssertTrue(rendered3.activeProxyGroupNames.isEmpty)
+        XCTAssertEqual(rendered3.requiredInterfaces, ["en10"])
+        let json3 = try XCTUnwrap(JSONSerialization.jsonObject(with: rendered3.data) as? [String: Any])
+        let rules3 = try XCTUnwrap(json3["rules"] as? [String])
+        XCTAssertTrue(rules3.contains("DOMAIN-SUFFIX,google.com,新加坡eSIM"))
+        XCTAssertTrue(rules3.contains("MATCH,新加坡eSIM"))
+        let dns3 = try XCTUnwrap(json3["dns"] as? [String: Any])
+        let ns3 = try XCTUnwrap(dns3["nameserver"] as? [String])
+        XCTAssertEqual(ns3, ["1.1.1.1#新加坡eSIM"])
+
+        // 4. Deleting referenced target clears alias targetID and fails render cleanly
+        profile.deleteTarget(id: sgESIM.id)
+        XCTAssertNil(profile.target(id: sgAlias.id)?.targetID)
+        XCTAssertThrowsError(try MihomoConfig.renderDetailed(profile)) { error in
+            guard case RoutingConfigurationError.invalidTarget = error else {
+                XCTFail("Expected invalidTarget, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testAliasTargetCyclePreventionAndValidation() {
+        let targetA = NetworkTarget(name: "A", mode: .alias, targetID: nil)
+        let targetB = NetworkTarget(name: "B", mode: .alias, targetID: targetA.id)
+        var profile = RoutingProfile(
+            targets: [targetA, targetB],
+            ruleGroups: [],
+            fallbackTarget: .target(targetA.id)
+        )
+
+        // Cannot point to self or create a cycle B -> A -> B
+        XCTAssertFalse(profile.canTarget(targetA.id, pointTo: targetA.id))
+        XCTAssertFalse(profile.canTarget(targetA.id, pointTo: targetB.id))
+        XCTAssertNil(profile.setAliasTarget(id: targetA.id, targetID: targetB.id))
+
+        // Force a cycle directly (e.g. hand-edited JSON) and verify detection + render rejection
+        profile.targets[0].targetID = targetB.id
+        if case .cycle(let path) = profile.resolveTarget(id: targetA.id) {
+            XCTAssertEqual(path.map(\.name), ["A", "B", "A"])
+        } else {
+            XCTFail("Expected cycle resolution result")
+        }
+
+        XCTAssertThrowsError(try MihomoConfig.renderDetailed(profile)) { error in
+            guard case RoutingConfigurationError.invalidTarget(let detail) = error else {
+                XCTFail("Expected invalidTarget for cycle, got \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("循环引用"))
+        }
+    }
+
+    func testIPv6InterfaceAndCustomDNSAreBracketedAndLinkLocalFiltered() throws {
+        let sgESIM = NetworkTarget(name: "新加坡eSIM", mode: .direct, interfaceName: "en10")
+        let profile = RoutingProfile(
+            targets: [sgESIM],
+            ruleGroups: [],
+            fallbackTarget: .target(sgESIM.id)
+        )
+
+        let config = try decodeJSON(
+            try MihomoConfig.render(
+                profile,
+                interfaceDNS: [
+                    "en10": ["192.168.0.1", "2400:1c00:480:4206::44", "fe80::57d:57b0:33b9:45d8"]
+                ]
+            )
+        )
+        let dns = try XCTUnwrap(config["dns"] as? [String: Any])
+        XCTAssertEqual(
+            dns["default-nameserver"] as? [String],
+            ["192.168.0.1", "[2400:1c00:480:4206::44]", "223.5.5.5", "119.29.29.29"]
+        )
+        XCTAssertEqual(
+            dns["nameserver"] as? [String],
+            ["192.168.0.1#新加坡eSIM", "[2400:1c00:480:4206::44]#新加坡eSIM"]
+        )
+        XCTAssertEqual(
+            dns["direct-nameserver"] as? [String],
+            ["192.168.0.1#新加坡eSIM", "[2400:1c00:480:4206::44]#新加坡eSIM"]
+        )
+
+        // When only link-local IPv6 is discovered on an interface, fall back cleanly to DoH
+        let linkLocalOnlyConfig = try decodeJSON(
+            try MihomoConfig.render(
+                profile,
+                interfaceDNS: ["en10": ["fe80::1", "fe80::2%en10"]]
+            )
+        )
+        let linkLocalDNS = try XCTUnwrap(linkLocalOnlyConfig["dns"] as? [String: Any])
+        XCTAssertEqual(
+            linkLocalDNS["nameserver"] as? [String],
+            ["https://1.1.1.1/dns-query#新加坡eSIM", "https://8.8.8.8/dns-query#新加坡eSIM"]
+        )
+
+        // Custom DNS servers with bare IPv6 addresses are also bracketed
+        var customProfile = profile
+        customProfile.customDNS = CustomDNSConfig(
+            entries: [
+                CustomDNSEntry(pattern: "example.com", kind: .server, value: "2606:4700:4700::1111", targetID: sgESIM.id)
+            ],
+            directServers: ["2400:3200::1"],
+            bootstrapServers: ["2400:3200:baba::1"]
+        )
+        let customConfig = try decodeJSON(try MihomoConfig.render(customProfile))
+        let customDNS = try XCTUnwrap(customConfig["dns"] as? [String: Any])
+        XCTAssertEqual(customDNS["default-nameserver"] as? [String], ["[2400:3200:baba::1]"])
+        XCTAssertEqual(customDNS["direct-nameserver"] as? [String], ["[2400:3200::1]#新加坡eSIM"])
+        let policy = try XCTUnwrap(customDNS["nameserver-policy"] as? [String: [String]])
+        XCTAssertEqual(policy["example.com"], ["[2606:4700:4700::1111]#新加坡eSIM"])
     }
 }

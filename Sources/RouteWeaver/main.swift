@@ -1,0 +1,3 @@
+import RouteWeaverRuntime
+
+RouteWeaverApp.main()

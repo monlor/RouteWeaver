@@ -3,14 +3,21 @@
 ## Targets & Dependency Direction
 
 ```text
-RouteWeaver (macOS SwiftUI App) ──▶ RoutingCore (Pure Domain, Config Renderer & Traffic Tracking)
-RouteWeaverTunHelper (Privileged Root Helper, standalone)
+RouteWeaver (thin @main executable) ──▶ RouteWeaverRuntime (macOS SwiftUI App & Runtime Library)
+RouteWeaverRuntime ──▶ RoutingCore (Pure Domain, Config Renderer & Traffic/DNS Tracking)
+RouteWeaverRuntime ──▶ TunHelperProtocol (Shared Privileged Helper Contract)
+RouteWeaverTunHelper (Privileged Root Helper) ──▶ TunHelperProtocol
+
 RoutingCoreTests ──▶ RoutingCore
+TunHelperProtocolTests ──▶ TunHelperProtocol
+RouteWeaverRuntimeTests ──▶ RouteWeaverRuntime
 ```
 
-- **`RoutingCore`** (`Sources/RoutingCore/`): Platform-neutral pure Swift library with zero SwiftUI/AppKit dependencies. Owns `RoutingProfile`, `RuleLibrary`, `MihomoConfig` rendering/validation, `SubscriptionParser`, `SubscriptionUsage`, `ConnectionMonitor` (`ConnectionTracker`, `DNSLogParser`, `TrafficFormatter`), `TrafficHistory`, `ProfileStore`, `BundledResourceManager`, and `MihomoRelease`.
-- **`RouteWeaver`** (`Sources/RouteWeaver/`): Native macOS SwiftUI application (macOS 13+). Owns views, state stores, process lifecycle management, macOS system/network inspection, and local Mihomo API communication.
-- **`RouteWeaverTunHelper`** (`Sources/RouteWeaverTunHelper/`): Standalone privileged executable installed via `TunHelperManager` to run Mihomo in TUN / LAN Gateway mode (managing `utun`, port 53 DNS, and `net.inet.ip.forwarding`).
+- **`RoutingCore`** (`Sources/RoutingCore/`): Platform-neutral pure Swift library with zero SwiftUI/AppKit dependencies. Owns `RoutingProfile` (including referential-integrity mutations), `RuleLibrary`, `MihomoConfig` rendering/validation (including `relayGroupName(for:)`), `SubscriptionParser`, `SubscriptionUsage`, `ConnectionMonitor` (`ConnectionTracker`, `DNSLogParser`, `DNSLogTracker`, `RelayChainResolver`, `RuleMatchDisplayIndex`, `TrafficFormatter`), `TrafficHistory`, `ProfileStore`, `BundledResourceManager`, `KillSwitchRules`, and `MihomoRelease`.
+- **`TunHelperProtocol`** (`Sources/TunHelperProtocol/`): Pure Foundation/Darwin shared contract depended on by both `RouteWeaverRuntime` and `RouteWeaverTunHelper`. Centralizes `TunHelperPaths`, typed `TunHelperCommand` CLI encoding/parsing, `GatewaySysctlState`/`TunDNSState`/`KillSwitchPersistedState`/`KillSwitchStatusReport` codecs, LaunchDaemon/LaunchAgent plist builders (`TunHelperPlists`), PF kill-switch rule rendering (`TunHelperPFRules`), and `ProcessInspector` (`proc_pidpath`, `isProcessAlive`, `verifyRootExecutable`, `parseLaunchctlPid`).
+- **`RouteWeaverRuntime`** (`Sources/RouteWeaverRuntime/`): Testable macOS SwiftUI library (macOS 13+). Owns views, state stores, process lifecycle orchestration, macOS system/network inspection, and local Mihomo control client.
+- **`RouteWeaver`** (`Sources/RouteWeaver/main.swift`): Thin executable entrypoint invoking `RouteWeaverApp.main()`.
+- **`RouteWeaverTunHelper`** (`Sources/RouteWeaverTunHelper/main.swift`): Audited setuid-root privileged executable using `TunHelperProtocol` to manage TUN, LAN Gateway, system DNS takeover, LaunchDaemon, and PF Kill Switch.
 
 ## State & Update-Rate Isolation
 
@@ -19,30 +26,24 @@ To avoid high-frequency updates triggering full-window SwiftUI re-renders, obser
 | Observable Store | Update Rate | Observed By |
 |---|---|---|
 | `AppState` | Low (profile edits, navigation, lifecycle transitions) | Root window, toolbar, sidebar, views |
-| `EngineController` | Low (`phase`, `lastError`, `isTunActive`, `isGatewayActive`, `isAttachedExternalCore`) | Forwarded to `AppState` |
+| `EngineController` | Low (`phase`, `lastError`, `isTunActive`, `isGatewayActive`, `isLaunchdManaged`, `isAttachedExternalCore`) | Forwarded to `AppState` |
+| `LiveProxyStore` | Low/Medium (live proxy groups, node selection, delay tests, rule-provider updates) | `OverviewView`, `RequestMonitorView` |
 | `EngineLogStore` | High (350 ms log tailing) | `EngineLogCardView` in `SettingsCoreView` only |
-| `ConnectionMonitorService` | High (WebSocket connection snapshots & batched DNS logs) | `RequestMonitorView`, `TrafficChartsView`, sidebar badge |
-| `CoreBinaryStore` | Low (binary resolution, GitHub release check/download) | `CoreBinaryCardView` in `SettingsCoreView`; binary/version changes forwarded to `AppState` |
-| `SubscriptionStore` | Medium (subscription fetch progress, cache, HostModule refresh) | `SubscriptionsView` (and its sheets), `OverviewSubscriptionUsageCard` |
+| `ConnectionMonitorService` | High (connection snapshots & batched DNS logs; background queue history persistence) | `RequestMonitorView`, `TrafficChartsView`, sidebar badge |
+| `CoreBinaryStore` | Low (binary resolution, GitHub release check/download/install) | `CoreBinaryCardView` in `SettingsCoreView`; binary/version changes forwarded to `AppState` |
+| `SubscriptionStore` | Medium (subscription fetch progress, payload cache, HostModule refresh) | `SubscriptionsView` (and its sheets), `OverviewSubscriptionUsageCard` |
 
-`AppState.configValidationError` is cached and recomputed only when `profile` or `controllerPort` mutates, avoiding repeated `MihomoConfig.renderDetailed(...)` serialization during SwiftUI view evaluations.
+`AppState.configValidationError` and `AppState.ruleMatchDisplayIndex` are cached and recomputed only when `profile` (or `controllerPort`) mutates, avoiding repeated config rendering or rule-index rebuilds during SwiftUI view evaluations.
 
-## Engine Subsystems
+## Seams & Test Adapters
 
-`EngineController` (`Sources/RouteWeaver/EngineController.swift`) is a focused `@MainActor` process lifecycle state machine backed by four dedicated modules:
-
-- **`EngineLogStore`** (`Sources/RouteWeaver/EngineLogStore.swift`): Memory ring truncation (140 KB cap), URL redaction, background serial queue disk persistence, and off-main-thread incremental log tailing.
-- **`NetworkEnvironment`** (`Sources/RouteWeaver/NetworkEnvironment.swift`): Stateless macOS `SystemConfiguration` / `getifaddrs` / `sysctl` / BSD socket inspection (`interfaceDNSServers`, `isIPForwardingEnabled`, `detailedInterfaces`, `validateAvailablePorts`).
-- **`ResourcePreloader`** (`Sources/RouteWeaver/ResourcePreloader.swift`): Missing provider/ruleset scanning, validated subscription cache syncing, legacy path migration, Geo file syncing to TUN workdir, and bounded concurrent downloading.
-- **`RuntimeSessionStore`** (`Sources/RouteWeaver/RuntimeSessionStore.swift`): Atomic persistence of `RuntimeCoreSession`, PID file parsing, `proc_pidpath` verification, and graceful user/TUN process termination.
-
-## Seams
-
-- **`MihomoControlClient`** (`Sources/RouteWeaver/LocalController.swift`): Protocol seam over Mihomo's local REST & WebSocket external-controller API. Production adapter is `LocalController`; consumed by `AppState` and `ConnectionMonitorService` so orchestration logic can be tested with stub clients without spawning a live Mihomo binary.
+- **`CoreRuntimeDriver` / `CoreRuntimeHandle`** (`Sources/RouteWeaverRuntime/CoreRuntimeDriver.swift`): Protocol seam behind `EngineController` unifying the four execution modes (`LaunchDaemon`, `LaunchAgent`, `RouteWeaverTunHelper`, `posix_spawn`) plus session probing/reattachment. Production adapter is `MacOSRuntimeDriver`; test adapter is `FakeRuntimeDriver` in `RouteWeaverRuntimeTests`.
+- **`MihomoControlClient`** (`Sources/RouteWeaverRuntime/LocalController.swift`): Protocol seam over Mihomo's local REST & WebSocket external-controller API, exposing high-level `AsyncThrowingStream`s (`connectionSnapshots()`, `dnsLogRecords(level:)`) so `URLSession` and WebSocket loops stay inside `LocalController`. Production adapter is `LocalController`; test adapter is `FakeMihomoControlClient` in `RouteWeaverRuntimeTests`.
 
 ## View Organization
 
-Feature views with multiple modal sheets live in feature-scoped subdirectories:
-- `Sources/RouteWeaver/Views/RuleGroups/`: `RuleGroupsView`, `AppPickerSheet`, `ProcessPickerSheet`, `SubconverterCatalogSheet`, `RuleSetPickerSheet`.
-- `Sources/RouteWeaver/Views/Subscriptions/`: `SubscriptionsView`, `SubscriptionSheets`, `HostModuleSheets`, `NodeGroupSheets`.
-- Standalone views: `MainView`, `OverviewView`, `RequestMonitorView`, `NetworkTargetsView`, `TrafficChartsView`, `SettingsCoreView`, `SharedComponents`.
+Feature views with multiple sub-views or modal sheets live in feature-scoped subdirectories:
+- `Sources/RouteWeaverRuntime/Views/Monitor/`: `RequestMonitorView`, `ConnectionListView`, `ConnectionInspectorView`, `DNSLogListView`, `DNSLogInspectorView`.
+- `Sources/RouteWeaverRuntime/Views/RuleGroups/`: `RuleGroupsView`, `AppPickerSheet`, `ProcessPickerSheet`, `SubconverterCatalogSheet`, `RuleSetPickerSheet`.
+- `Sources/RouteWeaverRuntime/Views/Subscriptions/`: `SubscriptionsView`, `SubscriptionSheets`, `HostModuleSheets`, `NodeGroupSheets`.
+- Standalone views: `MainView`, `OverviewView`, `CustomDNSView`, `NetworkTargetsView`, `TrafficChartsView`, `SettingsCoreView`, `SharedComponents`.

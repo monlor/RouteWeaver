@@ -7,10 +7,16 @@ var targets: [Target] = [
     .testTarget(name: "RoutingCoreTests", dependencies: ["RoutingCore"])
 ]
 #if os(macOS)
+products.append(.library(name: "TunHelperProtocol", targets: ["TunHelperProtocol"]))
+products.append(.library(name: "RouteWeaverRuntime", targets: ["RouteWeaverRuntime"]))
 products.append(.executable(name: "RouteWeaver", targets: ["RouteWeaver"]))
 products.append(.executable(name: "RouteWeaverTunHelper", targets: ["RouteWeaverTunHelper"]))
-targets.append(.executableTarget(name: "RouteWeaver", dependencies: ["RoutingCore"]))
-targets.append(.executableTarget(name: "RouteWeaverTunHelper"))
+targets.append(.target(name: "TunHelperProtocol"))
+targets.append(.testTarget(name: "TunHelperProtocolTests", dependencies: ["TunHelperProtocol"]))
+targets.append(.target(name: "RouteWeaverRuntime", dependencies: ["RoutingCore", "TunHelperProtocol"]))
+targets.append(.testTarget(name: "RouteWeaverRuntimeTests", dependencies: ["RouteWeaverRuntime", "RoutingCore", "TunHelperProtocol"]))
+targets.append(.executableTarget(name: "RouteWeaver", dependencies: ["RouteWeaverRuntime"]))
+targets.append(.executableTarget(name: "RouteWeaverTunHelper", dependencies: ["TunHelperProtocol"]))
 #endif
 
 let package = Package(

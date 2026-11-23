@@ -88,6 +88,35 @@ public struct CustomDNSEntry: Codable, Equatable, Identifiable, Sendable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
     }
+
+    /// Detects a common mistake where IP was entered in `pattern` and domain/wildcard was entered in `value`
+    /// (e.g. `192.168.100.2 -> *.monlor.cn`).
+    public var isLikelySwappedHost: Bool {
+        guard kind == .host else { return false }
+        let lhs = trimmedPattern
+        let rhsItems = splitValues
+        guard CustomDNSValidator.isIPAddress(lhs), !rhsItems.isEmpty else { return false }
+        return rhsItems.allSatisfy { CustomDNSValidator.isValidPattern($0, allowPolicyPrefix: false) }
+    }
+
+    /// Converts a swapped IP-first host entry (`192.168.100.2 -> *.monlor.cn`) into valid domain-first host entry/entries.
+    public func swappedHostEntries() -> [CustomDNSEntry] {
+        guard isLikelySwappedHost else { return [self] }
+        let targetIP = trimmedPattern
+        let domains = splitValues
+        return domains.enumerated().map { index, domain in
+            CustomDNSEntry(
+                id: index == 0 ? id : UUID(),
+                pattern: domain,
+                kind: .host,
+                value: targetIP,
+                targetID: nil,
+                bypassFakeIP: false,
+                note: note,
+                isEnabled: isEnabled
+            )
+        }
+    }
 }
 
 public struct CustomDNSConfig: Codable, Equatable, Sendable {
@@ -142,6 +171,10 @@ public enum CustomDNSValidator {
             return !suffix.isEmpty
         }
 
+        // Reject IP addresses as domain patterns (users sometimes accidentally swap IP and domain).
+        if isIPAddress(pattern) {
+            return false
+        }
         // Reject bare wildcards without any domain label.
         if pattern == "*" || pattern == "+" || pattern == "." || pattern == "+." || pattern == "*." {
             return false
@@ -187,11 +220,59 @@ public enum CustomDNSValidator {
         return isValidIPOrHostPort(base)
     }
 
-    /// Validates a single Host target value (IPv4, IPv6, or CNAME hostname).
+    /// Normalizes a Mihomo DNS server string so bare IPv6 literals are wrapped in brackets (`[2400:...]`),
+    /// preserving any `#outbound` suffix. Mihomo rejects unbracketed IPv6 nameservers with
+    /// `too many colons in address`.
+    public static func normalizedServer(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+
+        let base: String
+        let fragment: String?
+        if let hashIdx = trimmed.firstIndex(of: "#") {
+            base = String(trimmed[..<hashIdx])
+            fragment = String(trimmed[trimmed.index(after: hashIdx)...])
+        } else {
+            base = trimmed
+            fragment = nil
+        }
+
+        let normalizedBase: String
+        if !base.contains("://"),
+           !base.hasPrefix("["),
+           base.filter({ $0 == ":" }).count >= 2 {
+            normalizedBase = "[\(base)]"
+        } else {
+            normalizedBase = base
+        }
+
+        if let fragment {
+            return "\(normalizedBase)#\(fragment)"
+        }
+        return normalizedBase
+    }
+
+    /// Returns true if the string represents a link-local IPv6 address (`fe80::/10`, with or without brackets or `%zone`).
+    public static func isLinkLocalIPv6(_ raw: String) -> Bool {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if s.hasPrefix("["), let close = s.firstIndex(of: "]") {
+            s = String(s[s.index(after: s.startIndex)..<close])
+        }
+        if let zone = s.firstIndex(of: "%") {
+            s = String(s[..<zone])
+        }
+        return s.hasPrefix("fe8") || s.hasPrefix("fe9") || s.hasPrefix("fea") || s.hasPrefix("feb")
+    }
+
+    /// Validates a single Host target value (IPv4, IPv6, or concrete CNAME hostname; rejects wildcards).
     public static func isValidHostTarget(_ raw: String, forPattern pattern: String) -> Bool {
         let target = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty,
               !target.contains(","),
+              !target.contains("*"),
+              !target.hasPrefix("+."),
+              !target.hasPrefix("."),
+              !target.hasSuffix("."),
               !target.unicodeScalars.contains(where: CharacterSet.whitespacesAndNewlines.contains),
               !target.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
               target.caseInsensitiveCompare(pattern.trimmingCharacters(in: .whitespacesAndNewlines)) != .orderedSame else {
@@ -310,6 +391,25 @@ public enum CustomDNSParser {
                             value: "system"
                         )
                     )
+                } else if CustomDNSValidator.isIPAddress(lhs) {
+                    // IP-first `=` shorthand (e.g. `192.168.100.2 = *.monlor.cn` or `192.168.100.2 = nas.local, mac.local`)
+                    let hostTokens = rhs
+                        .split { $0 == "," || $0.isWhitespace }
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    for hostToken in hostTokens {
+                        guard CustomDNSValidator.isValidPattern(hostToken, allowPolicyPrefix: false),
+                              CustomDNSValidator.isValidHostTarget(lhs, forPattern: hostToken) else {
+                            continue
+                        }
+                        entries.append(
+                            CustomDNSEntry(
+                                pattern: hostToken,
+                                kind: .host,
+                                value: lhs
+                            )
+                        )
+                    }
                 } else {
                     guard CustomDNSValidator.isValidPattern(lhs, allowPolicyPrefix: false) else { continue }
                     let targets = rhs

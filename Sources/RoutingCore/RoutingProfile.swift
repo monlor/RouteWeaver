@@ -224,6 +224,7 @@ public struct RegexPreset: Identifiable, Sendable {
 public enum NetworkTargetMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case proxy
     case direct
+    case alias
 
     public var id: String { rawValue }
 
@@ -231,8 +232,16 @@ public enum NetworkTargetMode: String, Codable, CaseIterable, Identifiable, Send
         switch self {
         case .proxy: return "代理出口"
         case .direct: return "网卡直连"
+        case .alias: return "指向目标"
         }
     }
+}
+
+public enum TargetResolutionResult: Equatable, Sendable {
+    case resolved(leaf: NetworkTarget, path: [NetworkTarget])
+    case missingTarget(source: NetworkTarget, path: [NetworkTarget])
+    case cycle(path: [NetworkTarget])
+    case notFound
 }
 
 /// A reusable network target that rule groups point to.
@@ -241,6 +250,7 @@ public enum NetworkTargetMode: String, Codable, CaseIterable, Identifiable, Send
 /// - `美国出口节点组 => 有线网卡 (en0)` (without chain)
 /// - `美国出口节点组 => 系统默认网卡` (no chain, no bound interface)
 /// - `直连 => USB 网卡 (en5)`
+/// - `指向目标 => 新加坡节点TAG` (alias to another target for quick switching)
 public struct NetworkTarget: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
@@ -249,6 +259,8 @@ public struct NetworkTarget: Codable, Equatable, Identifiable, Sendable {
     public var relayGroupID: UUID?
     /// Optional BSD interface name (e.g. `en0`, `en5`). Nil or empty means system default route.
     public var interfaceName: String?
+    /// Referenced target ID when `mode == .alias`.
+    public var targetID: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -256,7 +268,8 @@ public struct NetworkTarget: Codable, Equatable, Identifiable, Sendable {
         mode: NetworkTargetMode,
         exitGroupID: UUID? = nil,
         relayGroupID: UUID? = nil,
-        interfaceName: String? = nil
+        interfaceName: String? = nil,
+        targetID: UUID? = nil
     ) {
         self.id = id
         self.name = name
@@ -264,9 +277,11 @@ public struct NetworkTarget: Codable, Equatable, Identifiable, Sendable {
         self.exitGroupID = exitGroupID
         self.relayGroupID = relayGroupID
         self.interfaceName = interfaceName
+        self.targetID = targetID
     }
 
     public var normalizedInterface: String? {
+        guard mode != .alias else { return nil }
         guard let raw = interfaceName?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return nil
         }
@@ -382,6 +397,8 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
     public var httpPort: Int? = nil
     public var socksPort: Int? = nil
     public var allowLAN: Bool = false
+    /// Enable IPv6 DNS resolution (AAAA) and IPv6 routing/outbound in Mihomo (disabled by default to avoid IPv6 timeouts on IPv4-only proxy nodes).
+    public var ipv6Enabled: Bool = false
     /// Transparent system-wide TUN mode settings.
     public var tunEnabled: Bool = false
     /// Act as a transparent LAN gateway (requires TUN + root helper; enables DNS 0.0.0.0:53, allow-lan, and kernel IP forwarding).
@@ -411,6 +428,7 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
         httpPort: Int? = nil,
         socksPort: Int? = nil,
         allowLAN: Bool = false,
+        ipv6Enabled: Bool = false,
         tunEnabled: Bool = false,
         gatewayModeEnabled: Bool = false,
         tunStack: TunStack = .mixed,
@@ -432,6 +450,7 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
         self.httpPort = httpPort
         self.socksPort = socksPort
         self.allowLAN = allowLAN
+        self.ipv6Enabled = ipv6Enabled
         self.tunEnabled = tunEnabled
         self.gatewayModeEnabled = gatewayModeEnabled
         self.tunStack = tunStack
@@ -457,6 +476,7 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
         httpPort = try c.decodeIfPresent(Int.self, forKey: .httpPort)
         socksPort = try c.decodeIfPresent(Int.self, forKey: .socksPort)
         allowLAN = try c.decodeIfPresent(Bool.self, forKey: .allowLAN) ?? false
+        ipv6Enabled = try c.decodeIfPresent(Bool.self, forKey: .ipv6Enabled) ?? false
         tunEnabled = try c.decodeIfPresent(Bool.self, forKey: .tunEnabled) ?? false
         gatewayModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .gatewayModeEnabled) ?? false
         tunStack = try c.decodeIfPresent(TunStack.self, forKey: .tunStack) ?? .mixed
@@ -489,6 +509,59 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
         return targets.first { $0.id == id }
     }
 
+    /// Resolves a target (following any `.alias` chain) to its concrete `.proxy` or `.direct` leaf target.
+    public func resolveTarget(id: UUID) -> TargetResolutionResult {
+        guard let start = target(id: id) else { return .notFound }
+        var visited = Set<UUID>()
+        var path: [NetworkTarget] = []
+        var current = start
+
+        while true {
+            if !visited.insert(current.id).inserted {
+                path.append(current)
+                return .cycle(path: path)
+            }
+            path.append(current)
+            guard current.mode == .alias else {
+                return .resolved(leaf: current, path: path)
+            }
+            guard let nextID = current.targetID, let next = target(id: nextID) else {
+                return .missingTarget(source: current, path: path)
+            }
+            current = next
+        }
+    }
+
+    public func resolvedLeafTarget(id: UUID?) -> NetworkTarget? {
+        guard let id else { return nil }
+        if case .resolved(let leaf, _) = resolveTarget(id: id) {
+            return leaf
+        }
+        return nil
+    }
+
+    /// Returns whether `sourceID` can safely point to `candidateID` without creating a self-loop or cycle.
+    public func canTarget(_ sourceID: UUID, pointTo candidateID: UUID) -> Bool {
+        if sourceID == candidateID { return false }
+        var visited = Set<UUID>([sourceID])
+        var currentID: UUID? = candidateID
+        while let id = currentID {
+            if !visited.insert(id).inserted {
+                return false
+            }
+            guard let next = target(id: id), next.mode == .alias else {
+                return true
+            }
+            currentID = next.targetID
+        }
+        return true
+    }
+
+    /// Returns alias targets that directly point to `targetID`.
+    public func aliasReferrers(of targetID: UUID) -> [NetworkTarget] {
+        targets.filter { $0.mode == .alias && $0.targetID == targetID }
+    }
+
     public func targetTitle(for ref: TargetReference) -> String {
         switch ref {
         case .reject:
@@ -498,34 +571,44 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
         }
     }
 
-    /// Targets actively referenced by enabled rule groups, fallback target, or explicit rule-provider proxy target.
+    /// Targets actively referenced by enabled rule groups, fallback target, explicit rule-provider proxy target,
+    /// or custom DNS server entries — expanded transitively through any `.alias` targets.
     public var activeTargetIDs: Set<UUID> {
-        var ids = Set<UUID>()
+        var seeds = Set<UUID>()
         for group in ruleGroups where group.isEnabled && !group.rules.filter(\.isEnabled).isEmpty {
             if case .target(let id) = group.target {
-                ids.insert(id)
+                seeds.insert(id)
             }
         }
         if case .target(let id) = fallbackTarget {
-            ids.insert(id)
+            seeds.insert(id)
         }
         if case .target(let id) = ruleProviderProxyMode,
            ruleGroups.contains(where: { $0.isEnabled && $0.rules.contains(where: { $0.isEnabled && $0.type == .ruleSet }) }) {
-            ids.insert(id)
+            seeds.insert(id)
         }
         for entry in customDNS.entries where entry.isEnabled && entry.kind == .server {
             if let targetID = entry.targetID {
-                ids.insert(targetID)
+                seeds.insert(targetID)
             }
         }
-        return ids
+
+        var expanded = Set<UUID>()
+        var stack = Array(seeds)
+        while let id = stack.popLast() {
+            guard expanded.insert(id).inserted else { continue }
+            if let target = target(id: id), target.mode == .alias, let nextID = target.targetID {
+                stack.append(nextID)
+            }
+        }
+        return expanded
     }
 
     /// Bound interfaces required by actively referenced targets.
     public var requiredInterfaces: Set<String> {
         let active = activeTargetIDs
         var result = Set<String>()
-        for target in targets where active.contains(target.id) {
+        for target in targets where active.contains(target.id) && target.mode != .alias {
             if let iface = target.normalizedInterface {
                 result.insert(iface)
             }
@@ -707,5 +790,135 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
             }
         }
         return migrated
+    }
+
+    // MARK: - Referential-Integrity Mutations
+
+    public mutating func setTunEnabled(_ enabled: Bool) {
+        tunEnabled = enabled
+        if !enabled && gatewayModeEnabled {
+            gatewayModeEnabled = false
+        }
+    }
+
+    public mutating func setGatewayModeEnabled(_ enabled: Bool) {
+        gatewayModeEnabled = enabled
+        if enabled {
+            if !tunEnabled {
+                tunEnabled = true
+            }
+            if !allowLAN {
+                allowLAN = true
+            }
+        }
+    }
+
+    @discardableResult
+    public mutating func removeRelay(fromTargetID id: UUID) -> String? {
+        guard let idx = targets.firstIndex(where: { $0.id == id }) else { return nil }
+        targets[idx].relayGroupID = nil
+        return targets[idx].name
+    }
+
+    @discardableResult
+    public mutating func deleteSubscription(id: UUID) -> String? {
+        let removedURL = subscriptions.first(where: { $0.id == id })?.url
+        subscriptions.removeAll { $0.id == id }
+        for idx in nodeGroups.indices where nodeGroups[idx].subscriptionID == id {
+            nodeGroups[idx].subscriptionID = nil
+        }
+        return removedURL
+    }
+
+    public mutating func deleteNodeGroup(id: UUID) {
+        nodeGroups.removeAll { $0.id == id }
+        for idx in targets.indices {
+            if targets[idx].exitGroupID == id { targets[idx].exitGroupID = nil }
+            if targets[idx].relayGroupID == id { targets[idx].relayGroupID = nil }
+        }
+    }
+
+    @discardableResult
+    public mutating func setAliasTarget(id: UUID, targetID: UUID?) -> (sourceName: String, targetName: String?)? {
+        guard let idx = targets.firstIndex(where: { $0.id == id }),
+              targets[idx].mode == .alias else { return nil }
+        if let targetID, !canTarget(id, pointTo: targetID) {
+            return nil
+        }
+        targets[idx].targetID = targetID
+        return (targets[idx].name, target(id: targetID)?.name)
+    }
+
+    public mutating func deleteTarget(id: UUID) {
+        targets.removeAll { $0.id == id }
+        for idx in targets.indices where targets[idx].targetID == id {
+            targets[idx].targetID = nil
+        }
+        let replacement: TargetReference = targets.first.map { .target($0.id) } ?? .reject
+        for idx in ruleGroups.indices where ruleGroups[idx].target == .target(id) {
+            ruleGroups[idx].target = replacement
+        }
+        if fallbackTarget == .target(id) {
+            fallbackTarget = replacement
+        }
+        if ruleProviderProxyMode == .target(id) {
+            ruleProviderProxyMode = .auto
+        }
+        for idx in customDNS.entries.indices where customDNS.entries[idx].targetID == id {
+            customDNS.entries[idx].targetID = nil
+        }
+    }
+
+    public mutating func deleteCustomDNSEntry(id: UUID) {
+        customDNS.entries.removeAll { $0.id == id }
+    }
+
+    public mutating func upsertCustomDNSEntry(_ entry: CustomDNSEntry) {
+        if let idx = customDNS.entries.firstIndex(where: { $0.id == entry.id }) {
+            customDNS.entries[idx] = entry
+        } else {
+            customDNS.entries.append(entry)
+        }
+    }
+
+    @discardableResult
+    public mutating func fixSwappedCustomDNSHosts() -> Int {
+        var fixedCount = 0
+        var updated: [CustomDNSEntry] = []
+        updated.reserveCapacity(customDNS.entries.count)
+        for entry in customDNS.entries {
+            if entry.isLikelySwappedHost {
+                fixedCount += 1
+                updated.append(contentsOf: entry.swappedHostEntries())
+            } else {
+                updated.append(entry)
+            }
+        }
+        if fixedCount > 0 {
+            customDNS.entries = updated
+        }
+        return fixedCount
+    }
+
+    @discardableResult
+    public mutating func importCustomDNSEntries(_ entries: [CustomDNSEntry]) -> (added: Int, updated: Int) {
+        guard !entries.isEmpty else { return (0, 0) }
+        var added = 0
+        var updated = 0
+        for item in entries {
+            if let existingIdx = customDNS.entries.firstIndex(where: {
+                $0.kind == item.kind && $0.trimmedPattern.caseInsensitiveCompare(item.trimmedPattern) == .orderedSame
+            }) {
+                var merged = customDNS.entries[existingIdx]
+                merged.value = item.value
+                merged.isEnabled = true
+                customDNS.entries[existingIdx] = merged
+                updated += 1
+            } else {
+                customDNS.entries.append(item)
+                added += 1
+            }
+        }
+        return (added, updated)
     }
 }

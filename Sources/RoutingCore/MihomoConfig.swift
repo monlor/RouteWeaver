@@ -67,6 +67,9 @@ public struct RenderedMihomoConfig: Sendable {
 }
 
 public enum MihomoConfig {
+    public static func relayGroupName(for outboundName: String) -> String {
+        "\(outboundName)·链式"
+    }
     public static let minimumVersion = "1.19.27"
     public static let healthCheckURL = "https://www.gstatic.com/generate_204"
     public static let defaultFakeIPRange = "198.18.0.1/16"
@@ -171,17 +174,40 @@ public enum MihomoConfig {
             }
         }
 
-        // 2. Collect all referenced targets (from enabled rule groups + fallback target)
+        // 2. Collect all referenced targets (expanding any `.alias` targets to their concrete leaf targets)
         let activeTargetIDs = profile.activeTargetIDs
         var targetNameSet = Set<String>()
-        var outboundNameByTargetID: [UUID: String] = [:]
+        var leafOutboundNameByID: [UUID: String] = [:]
+        var resolvedLeafByTargetID: [UUID: NetworkTarget] = [:]
 
         for target in profile.targets where activeTargetIDs.contains(target.id) {
             let cleanName = try checkedTargetName(target.name)
             guard targetNameSet.insert(cleanName).inserted else {
                 throw RoutingConfigurationError.duplicateTargetName(cleanName)
             }
-            outboundNameByTargetID[target.id] = cleanName
+            if target.mode == .alias {
+                switch profile.resolveTarget(id: target.id) {
+                case .resolved(let leaf, _):
+                    resolvedLeafByTargetID[target.id] = leaf
+                case .missingTarget(let source, _):
+                    throw RoutingConfigurationError.invalidTarget("「\(source.name)」未选择指向的网络目标，或所指向的目标不存在。")
+                case .cycle(let path):
+                    let chain = path.map(\.name).joined(separator: " → ")
+                    throw RoutingConfigurationError.invalidTarget("网络目标存在循环引用：\(chain)。")
+                case .notFound:
+                    throw RoutingConfigurationError.invalidTarget("网络目标「\(cleanName)」不存在。")
+                }
+            } else {
+                leafOutboundNameByID[target.id] = cleanName
+                resolvedLeafByTargetID[target.id] = target
+            }
+        }
+
+        var outboundNameByTargetID: [UUID: String] = [:]
+        for (targetID, leaf) in resolvedLeafByTargetID {
+            if let leafName = leafOutboundNameByID[leaf.id] {
+                outboundNameByTargetID[targetID] = leafName
+            }
         }
 
         // Verify fallback target exists if not REJECT
@@ -196,14 +222,14 @@ public enum MihomoConfig {
             }
         }
 
-        // 3. Build proxies, proxy-providers, and proxy-groups for all active targets
+        // 3. Build proxies, proxy-providers, and proxy-groups for all active concrete (leaf) targets
         var proxies: [[String: Any]] = []
         var providers: [String: [String: Any]] = [:]
         var providerKeyBySignature: [String: String] = [:]
         var proxyGroups: [[String: Any]] = []
         var activeProxyGroupNames: [String] = []
         var requiredInterfaces = Set<String>()
-        var usedOutboundNames = targetNameSet
+        var usedOutboundNames = Set(leafOutboundNameByID.values)
 
         func ensureSharedProvider(url: String, interface: String?) -> String {
             let signature = "\(url)\u{0}\(interface ?? "")"
@@ -224,8 +250,8 @@ public enum MihomoConfig {
             return key
         }
 
-        for (index, target) in profile.targets.enumerated() where activeTargetIDs.contains(target.id) {
-            let outboundName = outboundNameByTargetID[target.id]!
+        for (index, target) in profile.targets.enumerated() where leafOutboundNameByID[target.id] != nil {
+            let outboundName = leafOutboundNameByID[target.id]!
             let boundInterface: String?
             if let rawIface = target.normalizedInterface {
                 let checked = try checkedInterface(rawIface, field: "网络目标「\(outboundName)」网卡")
@@ -236,6 +262,9 @@ public enum MihomoConfig {
             }
 
             switch target.mode {
+            case .alias:
+                continue
+
             case .direct:
                 proxies.append(directProxy(outboundName, interface: boundInterface))
 
@@ -269,7 +298,7 @@ public enum MihomoConfig {
                         throw RoutingConfigurationError.ambiguousRelayPattern(outboundName)
                     }
 
-                    let relayMihomoGroupName = "\(outboundName)·链式"
+                    let relayMihomoGroupName = Self.relayGroupName(for: outboundName)
                     guard usedOutboundNames.insert(relayMihomoGroupName).inserted else {
                         throw RoutingConfigurationError.duplicateTargetName(relayMihomoGroupName)
                     }
@@ -326,24 +355,25 @@ public enum MihomoConfig {
             }
         }
 
-        // 4. Collect target metadata (mode & bound interface) for DNS routing and rule-provider proxy selection
+        // 4. Collect resolved target metadata (mode & bound interface) for DNS routing and rule-provider proxy selection
         var targetByID: [UUID: NetworkTarget] = [:]
         var boundInterfaceByTargetID: [UUID: String] = [:]
-        for target in profile.targets where activeTargetIDs.contains(target.id) {
-            targetByID[target.id] = target
-            if let iface = target.normalizedInterface {
-                boundInterfaceByTargetID[target.id] = iface
+        for (targetID, leaf) in resolvedLeafByTargetID {
+            targetByID[targetID] = leaf
+            if let iface = leaf.normalizedInterface {
+                boundInterfaceByTargetID[targetID] = iface
             }
         }
 
+        let activeLeafTargetIDs = Set(leafOutboundNameByID.keys)
         let preferredProxyGroupName: String? = {
             if case .target(let id) = profile.fallbackTarget,
                targetByID[id]?.mode == .proxy,
                let name = outboundNameByTargetID[id] {
                 return name
             }
-            for target in profile.targets where activeTargetIDs.contains(target.id) && target.mode == .proxy {
-                if let name = outboundNameByTargetID[target.id] {
+            for target in profile.targets where activeLeafTargetIDs.contains(target.id) && target.mode == .proxy {
+                if let name = leafOutboundNameByID[target.id] {
                     return name
                 }
             }
@@ -388,7 +418,7 @@ public enum MihomoConfig {
             "allow-lan": allowLAN,
             "bind-address": allowLAN ? "*" : "127.0.0.1",
             "log-level": profile.logLevel.rawValue,
-            "ipv6": true,
+            "ipv6": profile.ipv6Enabled,
             "tcp-concurrent": true,
             "unified-delay": true,
             "keep-alive-idle": 15,
@@ -460,6 +490,9 @@ public enum MihomoConfig {
             let pattern = entry.trimmedPattern
             switch entry.kind {
             case .host:
+                if entry.isLikelySwappedHost {
+                    throw RoutingConfigurationError.invalidDNS("Host 规则「\(pattern) → \(entry.value)」域名与 IP 顺序填反了，请在「自定义 DNS」页点击一键纠正。")
+                }
                 guard CustomDNSValidator.isValidPattern(pattern, allowPolicyPrefix: false) else {
                     throw RoutingConfigurationError.invalidDNS("Host 域名或通配符「\(entry.pattern)」格式无效。")
                 }
@@ -490,7 +523,8 @@ public enum MihomoConfig {
                 } else {
                     boundOutboundName = nil
                 }
-                let resolvedServers = rawServers.map { server -> String in
+                let resolvedServers = rawServers.map { rawServer -> String in
+                    let server = CustomDNSValidator.normalizedServer(rawServer)
                     if let outbound = boundOutboundName, !server.contains("#") {
                         return "\(server)#\(outbound)"
                     }
@@ -511,6 +545,7 @@ public enum MihomoConfig {
         for server in customDirectServers where !CustomDNSValidator.isValidServer(server) {
             throw RoutingConfigurationError.invalidDNS("自定义直连上游 DNS「\(server)」格式无效。")
         }
+        let normalizedCustomDirectServers = customDirectServers.map(CustomDNSValidator.normalizedServer)
 
         let customBootstrapServers = profile.customDNS.bootstrapServers
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -518,6 +553,7 @@ public enum MihomoConfig {
         for server in customBootstrapServers where !CustomDNSValidator.isValidServer(server) {
             throw RoutingConfigurationError.invalidDNS("自定义引导 DNS「\(server)」格式无效。")
         }
+        let normalizedCustomBootstrapServers = customBootstrapServers.map(CustomDNSValidator.normalizedServer)
 
         if !mergedHosts.isEmpty {
             config["hosts"] = mergedHosts
@@ -551,15 +587,15 @@ public enum MihomoConfig {
 
         config["dns"] = buildDNSConfig(
             profile: profile,
-            activeTargetIDs: activeTargetIDs,
+            activeLeafTargetIDs: activeLeafTargetIDs,
             outboundNameByTargetID: outboundNameByTargetID,
             targetByID: targetByID,
             boundInterfaceByTargetID: boundInterfaceByTargetID,
             dnsPolicies: builtRules.dnsPolicies,
             customDNSPolicies: customDNSPolicies,
             customFakeIPFilters: customFakeIPFilters,
-            customDirectServers: customDirectServers,
-            customBootstrapServers: customBootstrapServers,
+            customDirectServers: normalizedCustomDirectServers,
+            customBootstrapServers: normalizedCustomBootstrapServers,
             directBypassHosts: directBypassHosts,
             interfaceDNS: interfaceDNS
         )
@@ -628,16 +664,34 @@ public enum MihomoConfig {
         let dnsPolicies: [(key: String, servers: [String])]
     }
 
+    private static func usableInterfaceDNS(
+        for interface: String?,
+        in interfaceDNS: [String: [String]]
+    ) -> [String] {
+        guard let interface, let discovered = interfaceDNS[interface], !discovered.isEmpty else {
+            return []
+        }
+        var result: [String] = []
+        for rawIP in discovered {
+            let trimmed = rawIP.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !CustomDNSValidator.isLinkLocalIPv6(trimmed) else { continue }
+            let formatted = CustomDNSValidator.normalizedServer(trimmed)
+            if !result.contains(formatted) {
+                result.append(formatted)
+            }
+        }
+        return result
+    }
+
     private static func bootstrapDNS(
         interface: String?,
         interfaceDNS: [String: [String]],
         avoidSystemDNS: Bool = false
     ) -> [String] {
         var result: [String] = []
-        if let interface, let discovered = interfaceDNS[interface], !discovered.isEmpty {
-            for ip in discovered where !result.contains(ip) {
-                result.append(ip)
-            }
+        let discovered = usableInterfaceDNS(for: interface, in: interfaceDNS)
+        if !discovered.isEmpty {
+            result.append(contentsOf: discovered)
         } else if !avoidSystemDNS {
             result.append("system")
         }
@@ -661,18 +715,20 @@ public enum MihomoConfig {
         avoidSystemDNS: Bool = false
     ) -> [String] {
         if !customDirectServers.isEmpty {
+            let normalized = customDirectServers.map(CustomDNSValidator.normalizedServer)
             if let interface, !interface.isEmpty, let outboundName {
-                return customDirectServers.map { server in
+                return normalized.map { server in
                     server.contains("#") ? server : "\(server)#\(outboundName)"
                 }
             }
-            return customDirectServers
+            return normalized
         }
         guard let interface else {
             return avoidSystemDNS ? ["223.5.5.5", "119.29.29.29"] : ["system", "223.5.5.5", "119.29.29.29"]
         }
         if let outboundName {
-            if let discovered = interfaceDNS[interface], !discovered.isEmpty {
+            let discovered = usableInterfaceDNS(for: interface, in: interfaceDNS)
+            if !discovered.isEmpty {
                 var servers: [String] = []
                 for ip in discovered {
                     let entry = "\(ip)#\(outboundName)"
@@ -699,7 +755,7 @@ public enum MihomoConfig {
 
     private static func buildDNSConfig(
         profile: RoutingProfile,
-        activeTargetIDs: Set<UUID>,
+        activeLeafTargetIDs: Set<UUID>,
         outboundNameByTargetID: [UUID: String],
         targetByID: [UUID: NetworkTarget],
         boundInterfaceByTargetID: [UUID: String],
@@ -712,7 +768,7 @@ public enum MihomoConfig {
         interfaceDNS: [String: [String]]
     ) -> [String: Any] {
         let useTun = profile.effectiveTunEnabled
-        let activeTargets = profile.targets.filter { activeTargetIDs.contains($0.id) }
+        let activeTargets = profile.targets.filter { activeLeafTargetIDs.contains($0.id) }
 
         // If every active target binds the exact same interface (e.g. USB-only en10),
         // prefer that interface's discovered DNS; otherwise use system + IP fallbacks.
@@ -764,6 +820,8 @@ public enum MihomoConfig {
                         customDirectServers: customDirectServers,
                         avoidSystemDNS: useTun
                     )
+                case .alias:
+                    break
                 }
             }
             return directTargetDNS(
@@ -817,7 +875,7 @@ public enum MihomoConfig {
         let enhancedMode = useTun ? profile.tunDNSMode.rawValue : "redir-host"
         var dnsConfig: [String: Any] = [
             "enable": true,
-            "ipv6": true,
+            "ipv6": profile.ipv6Enabled,
             "cache-algorithm": "arc",
             "use-hosts": true,
             "use-system-hosts": true,
@@ -888,6 +946,8 @@ public enum MihomoConfig {
                         customDirectServers: customDirect,
                         avoidSystemDNS: profile.effectiveTunEnabled
                     )
+                case .alias:
+                    groupDNSServers = nil
                 }
             }
 
@@ -1145,9 +1205,9 @@ public enum MihomoConfig {
         }
         if automatic {
             data["url"] = healthCheckURL
-            data["interval"] = 300
+            data["interval"] = 120
             data["tolerance"] = tolerance
-            data["lazy"] = true
+            data["lazy"] = false
             data["expected-status"] = "204"
         }
         return data

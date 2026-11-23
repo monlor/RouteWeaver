@@ -327,9 +327,14 @@ public struct ConnectionTracker: Sendable {
     public private(set) var downloadSpeed: Int64 = 0
     public private(set) var lastUploadDelta: Int64 = 0
     public private(set) var lastDownloadDelta: Int64 = 0
+    public private(set) var lastTargetDeltas: [String: TrafficBytes] = [:]
+    public private(set) var targetSpeeds: [String: TrafficBytes] = [:]
     public private(set) var memoryUsage: Int64 = 0
     public private(set) var lastSnapshotAt: Date?
     public private(set) var speedHistory: [TrafficSpeedSample] = []
+    private var targetSpeedTimeline: [(id: Int64, timestamp: Date, speeds: [String: TrafficBytes])] = []
+    private var sessionTargetTotals: [String: TrafficBytes] = [:]
+    private var sessionTargetConnectionCounts: [String: Int] = [:]
     public let maxClosedHistory: Int
     public let maxSpeedSamples: Int
     private var nextSampleID: Int64 = 1
@@ -387,38 +392,52 @@ public struct ConnectionTracker: Sendable {
         }
     }
 
-    /// Aggregates traffic volume and connection count by primary routing target, sorted by total traffic descending.
+    /// Aggregates session-wide traffic volume and connection count by primary routing target (excluding internal relay connections),
+    /// sorted by total traffic descending. Retains totals even after old closed connections are trimmed.
     public var targetTrafficStats: [TargetTrafficStat] {
-        struct Accumulator {
-            var upload: Int64 = 0
-            var download: Int64 = 0
-            var count: Int = 0
-            var isDirect: Bool = false
-            var isRejected: Bool = false
-        }
-        var grouped: [String: Accumulator] = [:]
-        for item in recordsByID.values {
-            var acc = grouped[item.primaryTarget] ?? Accumulator()
-            acc.upload += item.upload
-            acc.download += item.download
-            acc.count += 1
-            if item.isDirect { acc.isDirect = true }
-            if item.isRejected { acc.isRejected = true }
-            grouped[item.primaryTarget] = acc
-        }
-        return grouped.map { key, acc in
-            TargetTrafficStat(
+        targetTrafficStats(directTargetNames: [])
+    }
+
+    public func targetTrafficStats(directTargetNames: Set<String>) -> [TargetTrafficStat] {
+        sessionTargetTotals.compactMap { key, bytes -> TargetTrafficStat? in
+            let count = sessionTargetConnectionCounts[key] ?? 0
+            guard bytes.total > 0 || count > 0 else { return nil }
+            let upper = key.uppercased()
+            let isDirect = directTargetNames.contains(key) || upper == "DIRECT" || upper.contains("直连")
+            let isRejected = upper == "REJECT" || upper == "REJECT-DROP"
+            return TargetTrafficStat(
                 target: key,
-                upload: acc.upload,
-                download: acc.download,
-                connectionCount: acc.count,
-                isDirect: acc.isDirect,
-                isRejected: acc.isRejected
+                upload: bytes.upload,
+                download: bytes.download,
+                connectionCount: count,
+                isDirect: isDirect,
+                isRejected: isRejected
             )
         }
         .sorted { lhs, rhs in
             if lhs.total != rhs.total { return lhs.total > rhs.total }
             return lhs.target.localizedStandardCompare(rhs.target) == .orderedAscending
+        }
+    }
+
+    public func sessionTraffic(for target: String) -> TrafficBytes {
+        sessionTargetTotals[target] ?? .zero
+    }
+
+    public func liveSpeed(for target: String) -> TrafficBytes {
+        targetSpeeds[target] ?? .zero
+    }
+
+    public func speedHistory(for target: String?) -> [TrafficSpeedSample] {
+        guard let target, !target.isEmpty else { return speedHistory }
+        return targetSpeedTimeline.map { entry in
+            let speed = entry.speeds[target] ?? .zero
+            return TrafficSpeedSample(
+                id: entry.id,
+                timestamp: entry.timestamp,
+                uploadSpeed: speed.upload,
+                downloadSpeed: speed.download
+            )
         }
     }
 
@@ -462,31 +481,34 @@ public struct ConnectionTracker: Sendable {
         memoryUsage = snapshot.memory
         lastSnapshotAt = now
 
-        let sample = TrafficSpeedSample(
-            id: nextSampleID,
-            timestamp: now,
-            uploadSpeed: uploadSpeed,
-            downloadSpeed: downloadSpeed
-        )
-        nextSampleID += 1
-        speedHistory.append(sample)
-        if speedHistory.count > maxSpeedSamples {
-            speedHistory.removeFirst(speedHistory.count - maxSpeedSamples)
-        }
-
         var seenActiveIDs = Set<String>()
         seenActiveIDs.reserveCapacity(snapshot.connections.count)
+        var currentTargetDeltas: [String: TrafficBytes] = [:]
 
         for conn in snapshot.connections {
             seenActiveIDs.insert(conn.id)
+            let isInnerConn = conn.metadata.type.caseInsensitiveCompare("Inner") == .orderedSame
+            let targetName = conn.chains.last ?? "DIRECT"
+
             if var existing = recordsByID[conn.id] {
+                let connUpDelta = max(0, conn.upload - existing.upload)
+                let connDownDelta = max(0, conn.download - existing.download)
                 let dt = now.timeIntervalSince(existing.lastSeenAt)
                 if dt > 0.05 {
-                    existing.uploadSpeed = Int64(Double(max(0, conn.upload - existing.upload)) / dt)
-                    existing.downloadSpeed = Int64(Double(max(0, conn.download - existing.download)) / dt)
+                    existing.uploadSpeed = Int64(Double(connUpDelta) / dt)
+                    existing.downloadSpeed = Int64(Double(connDownDelta) / dt)
                 } else {
                     existing.uploadSpeed = 0
                     existing.downloadSpeed = 0
+                }
+                if !isInnerConn && (connUpDelta > 0 || connDownDelta > 0) {
+                    var deltaAcc = currentTargetDeltas[targetName] ?? .zero
+                    deltaAcc.add(upload: connUpDelta, download: connDownDelta)
+                    currentTargetDeltas[targetName] = deltaAcc
+
+                    var sessionAcc = sessionTargetTotals[targetName] ?? .zero
+                    sessionAcc.add(upload: connUpDelta, download: connDownDelta)
+                    sessionTargetTotals[targetName] = sessionAcc
                 }
                 existing.metadata = conn.metadata
                 existing.upload = conn.upload
@@ -499,6 +521,20 @@ public struct ConnectionTracker: Sendable {
                 existing.closedAt = nil
                 recordsByID[conn.id] = existing
             } else {
+                let connUpDelta = max(0, conn.upload)
+                let connDownDelta = max(0, conn.download)
+                if !isInnerConn {
+                    sessionTargetConnectionCounts[targetName, default: 0] += 1
+                    if connUpDelta > 0 || connDownDelta > 0 {
+                        var deltaAcc = currentTargetDeltas[targetName] ?? .zero
+                        deltaAcc.add(upload: connUpDelta, download: connDownDelta)
+                        currentTargetDeltas[targetName] = deltaAcc
+
+                        var sessionAcc = sessionTargetTotals[targetName] ?? .zero
+                        sessionAcc.add(upload: connUpDelta, download: connDownDelta)
+                        sessionTargetTotals[targetName] = sessionAcc
+                    }
+                }
                 recordsByID[conn.id] = MonitoredConnection(
                     id: conn.id,
                     metadata: conn.metadata,
@@ -519,6 +555,36 @@ public struct ConnectionTracker: Sendable {
             }
         }
 
+        lastTargetDeltas = currentTargetDeltas
+
+        var computedTargetSpeeds: [String: TrafficBytes] = [:]
+        if let dt = elapsed {
+            for (target, delta) in currentTargetDeltas where delta.total > 0 {
+                computedTargetSpeeds[target] = TrafficBytes(
+                    upload: Int64(Double(delta.upload) / dt),
+                    download: Int64(Double(delta.download) / dt)
+                )
+            }
+        }
+        targetSpeeds = computedTargetSpeeds
+
+        let sampleID = nextSampleID
+        nextSampleID += 1
+        let sample = TrafficSpeedSample(
+            id: sampleID,
+            timestamp: now,
+            uploadSpeed: uploadSpeed,
+            downloadSpeed: downloadSpeed
+        )
+        speedHistory.append(sample)
+        if speedHistory.count > maxSpeedSamples {
+            speedHistory.removeFirst(speedHistory.count - maxSpeedSamples)
+        }
+        targetSpeedTimeline.append((id: sampleID, timestamp: now, speeds: computedTargetSpeeds))
+        if targetSpeedTimeline.count > maxSpeedSamples {
+            targetSpeedTimeline.removeFirst(targetSpeedTimeline.count - maxSpeedSamples)
+        }
+
         for id in recordsByID.keys where !seenActiveIDs.contains(id) {
             if var item = recordsByID[id], item.isActive {
                 item.isActive = false
@@ -535,6 +601,7 @@ public struct ConnectionTracker: Sendable {
     public mutating func markAllClosed(at now: Date = Date()) {
         uploadSpeed = 0
         downloadSpeed = 0
+        targetSpeeds.removeAll()
         for id in recordsByID.keys {
             if var item = recordsByID[id], item.isActive {
                 item.isActive = false
@@ -559,9 +626,14 @@ public struct ConnectionTracker: Sendable {
         downloadSpeed = 0
         lastUploadDelta = 0
         lastDownloadDelta = 0
+        lastTargetDeltas.removeAll()
+        targetSpeeds.removeAll()
         memoryUsage = 0
         lastSnapshotAt = nil
         speedHistory.removeAll()
+        targetSpeedTimeline.removeAll()
+        sessionTargetTotals.removeAll()
+        sessionTargetConnectionCounts.removeAll()
     }
 
     public func filtered(
@@ -1084,5 +1156,114 @@ public struct RuleMatchDisplayIndex: Sendable {
             .replacingOccurrences(of: "-", with: "")
             .replacingOccurrences(of: "_", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - DNS Log Tracker
+
+public struct DNSLogTracker: Equatable, Sendable {
+    public private(set) var records: [DNSLogRecord] = []
+    public let maxRecords: Int
+
+    public init(maxRecords: Int = 500) {
+        self.maxRecords = maxRecords
+    }
+
+    public mutating func appendBatch(_ batch: [DNSLogRecord]) {
+        guard !batch.isEmpty else { return }
+        records.insert(contentsOf: batch.reversed(), at: 0)
+        if records.count > maxRecords {
+            records.removeLast(records.count - maxRecords)
+        }
+    }
+
+    public mutating func clear() {
+        records.removeAll()
+    }
+
+    public var failedCount: Int {
+        records.reduce(into: 0) { count, item in
+            if item.status == .failed || item.isSuspiciousLoopback { count += 1 }
+        }
+    }
+
+    public var cacheHitCount: Int {
+        records.reduce(into: 0) { count, item in
+            if item.upstreamKind == .cache { count += 1 }
+        }
+    }
+
+    public func filtered(
+        scope: DNSLogFilterScope = .all,
+        sourceFilter: DNSLogSourceFilter = .all,
+        hideEmptyAnswers: Bool = false,
+        searchText: String = ""
+    ) -> [DNSLogRecord] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return records.filter { item in
+            switch scope {
+            case .all: break
+            case .resolved: if item.status != .resolved { return false }
+            case .failed: if item.status != .failed && !item.isSuspiciousLoopback { return false }
+            }
+            switch sourceFilter {
+            case .all: break
+            case .upstream: if item.upstreamKind != .upstream { return false }
+            case .cache: if item.upstreamKind != .cache { return false }
+            case .localOrFakeIP: if item.upstreamKind != .local && item.upstreamKind != .fakeIP { return false }
+            }
+            if hideEmptyAnswers && item.status == .resolved && item.answers.isEmpty {
+                return false
+            }
+            if !query.isEmpty {
+                let fields = [
+                    item.domain,
+                    item.recordType,
+                    item.answerSummary,
+                    item.upstream,
+                    item.cacheExpireAt ?? "",
+                    item.errorMessage ?? "",
+                ]
+                if !fields.contains(where: { $0.lowercased().contains(query) }) {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+}
+
+// MARK: - Relay Chain Resolver
+
+public struct ResolvedRelayChain: Equatable, Sendable {
+    public let relayGroupName: String
+    public let relayNode: String?
+
+    public init(relayGroupName: String, relayNode: String?) {
+        self.relayGroupName = relayGroupName
+        self.relayNode = relayNode
+    }
+}
+
+public enum RelayChainResolver {
+    public static func resolve(
+        for item: MonitoredConnection,
+        profile: RoutingProfile,
+        runtimeCurrentNodes: [String: String],
+        runtimeSelections: [String: String]
+    ) -> ResolvedRelayChain? {
+        guard !item.isInner, !item.isDirect, !item.isRejected else { return nil }
+        let relayGroupName = MihomoConfig.relayGroupName(for: item.primaryTarget)
+        let configuredRelay = profile.targets.contains { target in
+            target.name == item.primaryTarget && target.mode == .proxy && target.relayGroupID != nil
+        }
+        let rawNode = runtimeCurrentNodes[relayGroupName]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackNode = runtimeSelections[relayGroupName]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard configuredRelay || rawNode != nil || fallbackNode != nil else {
+            return nil
+        }
+        let resolvedNode = (rawNode?.isEmpty == false ? rawNode : nil)
+            ?? (fallbackNode?.isEmpty == false ? fallbackNode : nil)
+        return ResolvedRelayChain(relayGroupName: relayGroupName, relayNode: resolvedNode)
     }
 }

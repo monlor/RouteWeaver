@@ -1,17 +1,9 @@
 import Darwin
 import Foundation
 import SystemConfiguration
+import TunHelperProtocol
 
-private let authorizedMihomoPath = "/Library/Application Support/RouteWeaver/mihomo"
-private let gatewayStatePath = "/Library/Application Support/RouteWeaver/gateway-sysctl.state"
-private let tunDNSStatePath = "/Library/Application Support/RouteWeaver/tun-dns.state"
-private let tunHijackDNSServer = "198.18.0.2"
-private let helperVersion = "4"
-
-private struct GatewaySysctlState {
-    var prevForwarding: Int32
-    var prevRedirect: Int32
-}
+// MARK: - Gateway Sysctl
 
 private func readSysctlInt32(_ name: String) -> Int32? {
     var value: Int32 = 0
@@ -27,33 +19,20 @@ private func writeSysctlInt32(_ name: String, value: Int32) -> Bool {
 }
 
 private func loadGatewaySysctlState() -> GatewaySysctlState? {
-    let fd = open(gatewayStatePath, O_RDONLY)
+    let fd = open(TunHelperPaths.gatewayStatePath, O_RDONLY)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
     var buf = [UInt8](repeating: 0, count: 256)
     let n = Darwin.read(fd, &buf, buf.count)
     guard n > 0 else { return nil }
     let text = String(decoding: buf.prefix(n), as: UTF8.self)
-    var prevForwarding: Int32?
-    var prevRedirect: Int32?
-    for line in text.split(whereSeparator: \.isNewline) {
-        let parts = line.split(separator: "=", maxSplits: 1)
-        guard parts.count == 2 else { continue }
-        if parts[0] == "prev_forwarding", let v = Int32(parts[1]) {
-            prevForwarding = v
-        } else if parts[0] == "prev_redirect", let v = Int32(parts[1]) {
-            prevRedirect = v
-        }
-    }
-    guard let prevForwarding, let prevRedirect else { return nil }
-    return GatewaySysctlState(prevForwarding: prevForwarding, prevRedirect: prevRedirect)
+    return GatewaySysctlState.decodeText(text)
 }
 
 private func saveGatewaySysctlState(_ state: GatewaySysctlState) {
-    let fd = open(gatewayStatePath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    let fd = open(TunHelperPaths.gatewayStatePath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
     guard fd >= 0 else { return }
-    let text = "prev_forwarding=\(state.prevForwarding)\nprev_redirect=\(state.prevRedirect)\n"
-    let bytes = Array(text.utf8)
+    let bytes = Array(state.encodeText().utf8)
     _ = bytes.withUnsafeBytes { ptr in
         Darwin.write(fd, ptr.baseAddress, ptr.count)
     }
@@ -62,7 +41,6 @@ private func saveGatewaySysctlState(_ state: GatewaySysctlState) {
 }
 
 private func enableGatewaySysctl() -> Bool {
-    // Preserve original pre-gateway values if a previous gateway session crashed without restoring.
     let existing = loadGatewaySysctlState()
     let prevForwarding = existing?.prevForwarding ?? readSysctlInt32("net.inet.ip.forwarding") ?? 0
     let prevRedirect = existing?.prevRedirect ?? readSysctlInt32("net.inet.ip.redirect") ?? 1
@@ -70,10 +48,9 @@ private func enableGatewaySysctl() -> Bool {
 
     guard writeSysctlInt32("net.inet.ip.forwarding", value: 1) else {
         writeStderr("RouteWeaverTunHelper: failed to enable net.inet.ip.forwarding (errno \(errno))")
-        _ = unlink(gatewayStatePath)
+        _ = unlink(TunHelperPaths.gatewayStatePath)
         return false
     }
-    // Disable ICMP redirects so LAN clients on the same subnet do not bypass this gateway.
     _ = writeSysctlInt32("net.inet.ip.redirect", value: 0)
     return true
 }
@@ -82,28 +59,19 @@ private func restoreGatewaySysctlIfNeeded() {
     guard let saved = loadGatewaySysctlState() else { return }
     _ = writeSysctlInt32("net.inet.ip.forwarding", value: saved.prevForwarding)
     _ = writeSysctlInt32("net.inet.ip.redirect", value: saved.prevRedirect)
-    _ = unlink(gatewayStatePath)
+    _ = unlink(TunHelperPaths.gatewayStatePath)
 }
 
 // MARK: - System DNS Takeover & Restoration (Anti-DNS-Leak for TUN)
 
-private struct SavedServiceDNS: Codable {
-    var serviceID: String
-    var servers: [String]?
-}
-
-private struct TunDNSState: Codable {
-    var services: [SavedServiceDNS]
-}
-
 private func loadTunDNSState() -> TunDNSState? {
-    guard let data = FileManager.default.contents(atPath: tunDNSStatePath) else { return nil }
+    guard let data = FileManager.default.contents(atPath: TunHelperPaths.tunDNSStatePath) else { return nil }
     return try? JSONDecoder().decode(TunDNSState.self, from: data)
 }
 
 private func saveTunDNSState(_ state: TunDNSState) {
     guard let data = try? JSONEncoder().encode(state) else { return }
-    let fd = open(tunDNSStatePath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    let fd = open(TunHelperPaths.tunDNSStatePath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
     guard fd >= 0 else { return }
     data.withUnsafeBytes { ptr in
         if let base = ptr.baseAddress {
@@ -149,7 +117,6 @@ private func takeoverSystemDNS() {
         return
     }
 
-    // Preserve any previously saved pre-TUN DNS state if a prior session crashed before restoring.
     var existingByID: [String: SavedServiceDNS] = [:]
     if let existing = loadTunDNSState() {
         for item in existing.services {
@@ -171,7 +138,7 @@ private func takeoverSystemDNS() {
         if existingByID[serviceID] == nil {
             let cleanOriginal: [String]?
             if let currentServers, !currentServers.isEmpty,
-               currentServers != [tunHijackDNSServer] {
+               currentServers != [TunHelperPaths.tunHijackDNSServer] {
                 cleanOriginal = currentServers
             } else {
                 cleanOriginal = nil
@@ -181,8 +148,8 @@ private func takeoverSystemDNS() {
             savedList.append(entry)
         }
 
-        if currentServers != [tunHijackDNSServer] {
-            config[kSCPropNetDNSServerAddresses as String] = [tunHijackDNSServer]
+        if currentServers != [TunHelperPaths.tunHijackDNSServer] {
+            config[kSCPropNetDNSServerAddresses as String] = [TunHelperPaths.tunHijackDNSServer]
             if SCNetworkProtocolSetConfiguration(dnsProto, config as CFDictionary) {
                 modified = true
             }
@@ -234,27 +201,80 @@ private func restoreSystemDNSIfNeeded() {
             return
         }
     }
-    _ = unlink(tunDNSStatePath)
+    _ = unlink(TunHelperPaths.tunDNSStatePath)
 }
 
-private let procPidPathMaxSize = 4096
+// MARK: - Process & File Helpers
 
-@_silgen_name("proc_pidpath")
-private func c_proc_pidpath(_ pid: Int32, _ buffer: UnsafeMutableRawPointer?, _ buffersize: UInt32) -> Int32
-
-private func processExecutablePath(pid: pid_t) -> String? {
-    var buffer = [CChar](repeating: 0, count: procPidPathMaxSize)
-    let length = buffer.withUnsafeMutableBytes { ptr in
-        c_proc_pidpath(pid, ptr.baseAddress, UInt32(procPidPathMaxSize))
+private func writeStderr(_ message: String) {
+    let data = Array((message + "\n").utf8)
+    _ = data.withUnsafeBytes { ptr in
+        Darwin.write(STDERR_FILENO, ptr.baseAddress, ptr.count)
     }
-    guard length > 0 else { return nil }
-    return String(cString: buffer)
 }
 
-private func isProcessAlive(_ pid: pid_t) -> Bool {
-    guard pid > 1 else { return false }
-    if kill(pid, 0) == 0 { return true }
-    return errno == EPERM
+private func writePidFile(_ pid: pid_t, to path: String) {
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    guard fd >= 0 else { return }
+    let bytes = Array("\(pid)\n".utf8)
+    _ = bytes.withUnsafeBytes { ptr in
+        Darwin.write(fd, ptr.baseAddress, ptr.count)
+    }
+    _ = fchmod(fd, 0o644)
+    close(fd)
+}
+
+private func writeRootFileAtomically(_ data: Data, to targetPath: String) -> Bool {
+    let tmpPath = targetPath + ".tmp"
+    let fd = open(tmpPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    guard fd >= 0 else { return false }
+    var writtenAll = true
+    data.withUnsafeBytes { ptr in
+        guard let base = ptr.baseAddress else { return }
+        var total = 0
+        while total < ptr.count {
+            let n = Darwin.write(fd, base.advanced(by: total), ptr.count - total)
+            if n <= 0 {
+                writtenAll = false
+                break
+            }
+            total += n
+        }
+    }
+    _ = fchown(fd, 0, 0)
+    _ = fchmod(fd, 0o644)
+    close(fd)
+    guard writtenAll, rename(tmpPath, targetPath) == 0 else {
+        _ = unlink(tmpPath)
+        return false
+    }
+    return true
+}
+
+private func verifyAuthorizedMihomo() -> Bool {
+    switch ProcessInspector.verifyRootExecutable(at: TunHelperPaths.authorizedMihomoPath, requireSetuid: false) {
+    case .success:
+        guard access(TunHelperPaths.authorizedMihomoPath, X_OK) == 0 else {
+            writeStderr("RouteWeaverTunHelper: authorized mihomo is not executable")
+            return false
+        }
+        return true
+    case .failure(.notFound):
+        writeStderr("RouteWeaverTunHelper: authorized mihomo binary not found at \(TunHelperPaths.authorizedMihomoPath)")
+        return false
+    case .failure(.notRegularFile):
+        writeStderr("RouteWeaverTunHelper: authorized mihomo must be a regular file (symlinks rejected)")
+        return false
+    case .failure(.notOwnedByRoot):
+        writeStderr("RouteWeaverTunHelper: authorized mihomo must be owned by root")
+        return false
+    case .failure(.worldWritable):
+        writeStderr("RouteWeaverTunHelper: authorized mihomo must not be world-writable")
+        return false
+    case .failure(.notExecutable), .failure(.missingSetuid):
+        writeStderr("RouteWeaverTunHelper: authorized mihomo is not executable")
+        return false
+    }
 }
 
 private func stopAuthorizedPid(_ pid: pid_t) -> Int32 {
@@ -266,17 +286,17 @@ private func stopAuthorizedPid(_ pid: pid_t) -> Int32 {
         writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
         return 77
     }
-    guard verifyAuthorizedMihomo() else {
-        return 77
-    }
-    if !isProcessAlive(pid) {
+    guard verifyAuthorizedMihomo() else { return 77 }
+
+    if !ProcessInspector.isProcessAlive(pid) {
         _ = setgid(0)
         _ = setuid(0)
         restoreSystemDNSIfNeeded()
         restoreGatewaySysctlIfNeeded()
         return 0
     }
-    guard let exePath = processExecutablePath(pid: pid), exePath == authorizedMihomoPath else {
+    guard let exePath = ProcessInspector.processExecutablePath(pid: pid),
+          exePath == TunHelperPaths.authorizedMihomoPath else {
         writeStderr("RouteWeaverTunHelper: target pid \(pid) is not the authorized mihomo binary")
         return 77
     }
@@ -295,7 +315,7 @@ private func stopAuthorizedPid(_ pid: pid_t) -> Int32 {
     }
 
     for _ in 0..<60 {
-        if !isProcessAlive(pid) {
+        if !ProcessInspector.isProcessAlive(pid) {
             restoreSystemDNSIfNeeded()
             restoreGatewaySysctlIfNeeded()
             return 0
@@ -305,14 +325,14 @@ private func stopAuthorizedPid(_ pid: pid_t) -> Int32 {
 
     _ = kill(pid, SIGKILL)
     for _ in 0..<20 {
-        if !isProcessAlive(pid) {
+        if !ProcessInspector.isProcessAlive(pid) {
             restoreSystemDNSIfNeeded()
             restoreGatewaySysctlIfNeeded()
             return 0
         }
         usleep(50_000)
     }
-    if !isProcessAlive(pid) {
+    if !ProcessInspector.isProcessAlive(pid) {
         restoreSystemDNSIfNeeded()
         restoreGatewaySysctlIfNeeded()
         return 0
@@ -320,66 +340,14 @@ private func stopAuthorizedPid(_ pid: pid_t) -> Int32 {
     return 71
 }
 
-private func writePidFile(_ pid: pid_t, to path: String) {
-    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-    guard fd >= 0 else { return }
-    let text = "\(pid)\n"
-    let bytes = Array(text.utf8)
-    _ = bytes.withUnsafeBytes { ptr in
-        Darwin.write(fd, ptr.baseAddress, ptr.count)
-    }
-    _ = fchmod(fd, 0o644)
-    close(fd)
-}
-
-private func writeStderr(_ message: String) {
-    let data = Array((message + "\n").utf8)
-    _ = data.withUnsafeBytes { ptr in
-        Darwin.write(STDERR_FILENO, ptr.baseAddress, ptr.count)
-    }
-}
-
-private func isSafeAbsolutePath(_ path: String) -> Bool {
-    guard path.hasPrefix("/"), !path.isEmpty, !path.contains("\0") else { return false }
-    let components = path.split(separator: "/")
-    return !components.contains("..")
-}
-
-private func verifyAuthorizedMihomo() -> Bool {
-    var st = stat()
-    guard lstat(authorizedMihomoPath, &st) == 0 else {
-        writeStderr("RouteWeaverTunHelper: authorized mihomo binary not found at \(authorizedMihomoPath)")
-        return false
-    }
-    guard (st.st_mode & S_IFMT) == S_IFREG else {
-        writeStderr("RouteWeaverTunHelper: authorized mihomo must be a regular file (symlinks rejected)")
-        return false
-    }
-    guard st.st_uid == 0 else {
-        writeStderr("RouteWeaverTunHelper: authorized mihomo must be owned by root")
-        return false
-    }
-    guard (st.st_mode & 0o002) == 0 else {
-        writeStderr("RouteWeaverTunHelper: authorized mihomo must not be world-writable")
-        return false
-    }
-    guard access(authorizedMihomoPath, X_OK) == 0 else {
-        writeStderr("RouteWeaverTunHelper: authorized mihomo is not executable")
-        return false
-    }
-    return true
-}
-
 private func stopChild(_ pid: pid_t, kq: Int32) -> Int32 {
     _ = kill(pid, SIGTERM)
-
     var ev = kevent()
     var ts = timespec(tv_sec: 3, tv_nsec: 0)
     let n = kevent(kq, nil, 0, &ev, 1, &ts)
     if n <= 0 || ev.filter != EVFILT_PROC {
         _ = kill(pid, SIGKILL)
     }
-
     var status: Int32 = 0
     _ = waitpid(pid, &status, 0)
     return 0
@@ -393,101 +361,342 @@ private func exitCode(from waitStatus: Int32) -> Int32 {
     return 128 + sig
 }
 
-private func runHelper() -> Int32 {
-    let args = CommandLine.arguments
-    if args.count == 2 && args[1] == "--version" {
-        let out = Array("RouteWeaverTunHelper \(helperVersion)\n".utf8)
-        _ = out.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
-        return 0
-    }
+private func runLaunchctl(_ arguments: [String]) -> Int32 {
+    let launchctlPath = "/bin/launchctl"
+    let argvStrings = [launchctlPath] + arguments
+    let cArgv: [UnsafeMutablePointer<CChar>?] = argvStrings.map { strdup($0) } + [nil]
+    defer { for ptr in cArgv { free(ptr) } }
 
-    var workDir: String?
-    var configPath: String?
-    var logFilePath: String?
-    var pidFilePath: String?
-    var stopPid: pid_t?
-    var gatewayMode = false
-    var i = 1
-    while i < args.count {
-        switch args[i] {
-        case "--work-dir":
-            if i + 1 < args.count {
-                workDir = args[i + 1]
-                i += 2
-            } else {
-                writeStderr("RouteWeaverTunHelper: missing value for --work-dir")
-                return 64
-            }
-        case "--config":
-            if i + 1 < args.count {
-                configPath = args[i + 1]
-                i += 2
-            } else {
-                writeStderr("RouteWeaverTunHelper: missing value for --config")
-                return 64
-            }
-        case "--log-file":
-            if i + 1 < args.count {
-                logFilePath = args[i + 1]
-                i += 2
-            } else {
-                writeStderr("RouteWeaverTunHelper: missing value for --log-file")
-                return 64
-            }
-        case "--pid-file":
-            if i + 1 < args.count {
-                pidFilePath = args[i + 1]
-                i += 2
-            } else {
-                writeStderr("RouteWeaverTunHelper: missing value for --pid-file")
-                return 64
-            }
-        case "--gateway":
-            gatewayMode = true
-            i += 1
-        case "--stop-pid":
-            if i + 1 < args.count, let parsed = Int32(args[i + 1]), parsed > 1 {
-                stopPid = pid_t(parsed)
-                i += 2
-            } else {
-                writeStderr("RouteWeaverTunHelper: valid pid is required for --stop-pid")
-                return 64
-            }
-        default:
-            writeStderr("RouteWeaverTunHelper: unknown argument \(args[i])")
-            return 64
-        }
-    }
+    var fileActions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&fileActions)
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
 
-    if let stopPid {
-        return stopAuthorizedPid(stopPid)
-    }
+    var pid: pid_t = 0
+    let spawnErr = posix_spawn(&pid, launchctlPath, &fileActions, nil, cArgv, nil)
+    guard spawnErr == 0, pid > 0 else { return 71 }
+    var status: Int32 = 0
+    _ = waitpid(pid, &status, 0)
+    return exitCode(from: status)
+}
 
-    guard let workDir, let configPath,
-          isSafeAbsolutePath(workDir),
-          isSafeAbsolutePath(configPath) else {
-        writeStderr("RouteWeaverTunHelper: valid absolute --work-dir and --config paths are required")
-        return 64
-    }
+// MARK: - LaunchDaemon Management
 
-    if let logFilePath, !isSafeAbsolutePath(logFilePath) {
-        writeStderr("RouteWeaverTunHelper: invalid --log-file path")
-        return 64
-    }
-
-    if let pidFilePath, !isSafeAbsolutePath(pidFilePath) {
-        writeStderr("RouteWeaverTunHelper: invalid --pid-file path")
-        return 64
-    }
-
+private func installTunDaemon(
+    workDir: String,
+    configPath: String,
+    logFilePath: String,
+    pidFilePath: String,
+    gatewayMode: Bool
+) -> Int32 {
     guard geteuid() == 0 else {
         writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
         return 77
     }
+    guard verifyAuthorizedMihomo() else { return 77 }
+    var cfgStat = stat()
+    guard stat(configPath, &cfgStat) == 0, (cfgStat.st_mode & S_IFMT) == S_IFREG else {
+        writeStderr("RouteWeaverTunHelper: config file is missing or not a regular file")
+        return 66
+    }
 
-    guard verifyAuthorizedMihomo() else {
+    _ = setgid(0)
+    _ = setuid(0)
+    _ = runLaunchctl(["bootout", TunHelperPaths.tunServiceTarget])
+
+    guard let data = try? TunHelperPlists.tunDaemonPlistData(
+        workDir: workDir,
+        configPath: configPath,
+        logFilePath: logFilePath,
+        pidFilePath: pidFilePath,
+        gatewayMode: gatewayMode
+    ) else {
+        writeStderr("RouteWeaverTunHelper: failed to serialize LaunchDaemon plist")
+        return 71
+    }
+
+    guard writeRootFileAtomically(data, to: TunHelperPaths.tunDaemonPlistPath) else {
+        writeStderr("RouteWeaverTunHelper: failed to write LaunchDaemon plist")
+        return 73
+    }
+
+    let bootstrapCode = runLaunchctl(["bootstrap", "system", TunHelperPaths.tunDaemonPlistPath])
+    if bootstrapCode != 0 {
+        _ = unlink(TunHelperPaths.tunDaemonPlistPath)
+        writeStderr("RouteWeaverTunHelper: launchctl bootstrap failed with code \(bootstrapCode)")
+        return 71
+    }
+    return 0
+}
+
+private func uninstallTunDaemon() -> Int32 {
+    guard geteuid() == 0 else {
+        writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
         return 77
     }
+    guard verifyAuthorizedMihomo() else { return 77 }
+    _ = setgid(0)
+    _ = setuid(0)
+
+    _ = runLaunchctl(["bootout", TunHelperPaths.tunServiceTarget])
+    _ = unlink(TunHelperPaths.tunDaemonPlistPath)
+    usleep(150_000)
+    restoreSystemDNSIfNeeded()
+    restoreGatewaySysctlIfNeeded()
+    return 0
+}
+
+// MARK: - PF Kill Switch
+
+private func loadKillSwitchState() -> KillSwitchPersistedState? {
+    let fd = open(TunHelperPaths.killSwitchStatePath, O_RDONLY)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var buf = [UInt8](repeating: 0, count: 512)
+    let n = Darwin.read(fd, &buf, buf.count)
+    guard n > 0 else { return nil }
+    return KillSwitchPersistedState.decodeText(String(decoding: buf.prefix(n), as: UTF8.self))
+}
+
+private func saveKillSwitchState(_ state: KillSwitchPersistedState) {
+    let fd = open(TunHelperPaths.killSwitchStatePath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    guard fd >= 0 else { return }
+    let bytes = Array(state.encodeText().utf8)
+    _ = bytes.withUnsafeBytes { ptr in
+        Darwin.write(fd, ptr.baseAddress, ptr.count)
+    }
+    _ = fchown(fd, 0, 0)
+    _ = fchmod(fd, 0o644)
+    close(fd)
+}
+
+private func readKillSwitchToken() -> String? {
+    let fd = open(TunHelperPaths.killSwitchTokenPath, O_RDONLY)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var buf = [UInt8](repeating: 0, count: 256)
+    let n = Darwin.read(fd, &buf, buf.count)
+    guard n > 0 else { return nil }
+    let token = String(decoding: buf.prefix(n), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    return token.isEmpty ? nil : token
+}
+
+private func saveKillSwitchToken(_ token: String) {
+    let fd = open(TunHelperPaths.killSwitchTokenPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    guard fd >= 0 else { return }
+    let bytes = Array((token + "\n").utf8)
+    _ = bytes.withUnsafeBytes { ptr in
+        Darwin.write(fd, ptr.baseAddress, ptr.count)
+    }
+    _ = fchown(fd, 0, 0)
+    _ = fchmod(fd, 0o644)
+    close(fd)
+}
+
+private func runPfctl(_ arguments: [String], stdin stdinText: String? = nil) -> (status: Int32, output: String) {
+    let pfctlPath = "/sbin/pfctl"
+    let argvStrings = [pfctlPath] + arguments
+    let cArgv: [UnsafeMutablePointer<CChar>?] = argvStrings.map { strdup($0) } + [nil]
+    defer { for ptr in cArgv { free(ptr) } }
+
+    var outPipe: [Int32] = [-1, -1]
+    guard pipe(&outPipe) == 0 else { return (71, "pipe failed") }
+
+    var inPipe: [Int32] = [-1, -1]
+    if stdinText != nil {
+        guard pipe(&inPipe) == 0 else {
+            close(outPipe[0])
+            close(outPipe[1])
+            return (71, "stdin pipe failed")
+        }
+    }
+
+    var fileActions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&fileActions)
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+    if stdinText != nil {
+        posix_spawn_file_actions_adddup2(&fileActions, inPipe[0], STDIN_FILENO)
+        posix_spawn_file_actions_addclose(&fileActions, inPipe[0])
+        posix_spawn_file_actions_addclose(&fileActions, inPipe[1])
+    } else {
+        posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    }
+    posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], STDOUT_FILENO)
+    posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], STDERR_FILENO)
+    posix_spawn_file_actions_addclose(&fileActions, outPipe[0])
+    posix_spawn_file_actions_addclose(&fileActions, outPipe[1])
+
+    var pid: pid_t = 0
+    let spawnErr = posix_spawn(&pid, pfctlPath, &fileActions, nil, cArgv, nil)
+    close(outPipe[1])
+    if stdinText != nil { close(inPipe[0]) }
+
+    guard spawnErr == 0, pid > 0 else {
+        close(outPipe[0])
+        if stdinText != nil { close(inPipe[1]) }
+        return (71, "posix_spawn pfctl failed (errno \(spawnErr))")
+    }
+
+    if let stdinText {
+        let bytes = Array(stdinText.utf8)
+        bytes.withUnsafeBytes { ptr in
+            guard let base = ptr.baseAddress else { return }
+            var total = 0
+            while total < ptr.count {
+                let n = Darwin.write(inPipe[1], base.advanced(by: total), ptr.count - total)
+                if n <= 0 { break }
+                total += n
+            }
+        }
+        close(inPipe[1])
+    }
+
+    var outputData = Data()
+    var buf = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let n = Darwin.read(outPipe[0], &buf, buf.count)
+        if n > 0 {
+            outputData.append(buf, count: n)
+        } else if n < 0 && errno == EINTR {
+            continue
+        } else {
+            break
+        }
+    }
+    close(outPipe[0])
+
+    var status: Int32 = 0
+    _ = waitpid(pid, &status, 0)
+    let text = String(decoding: outputData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    return (exitCode(from: status), text)
+}
+
+private func isPFCurrentlyEnabled() -> Bool {
+    let info = runPfctl(["-s", "info"])
+    return info.status == 0 && info.output.contains("Status: Enabled")
+}
+
+private func isKillSwitchAnchorLoaded() -> Bool {
+    let rules = runPfctl(["-a", TunHelperPaths.killSwitchAnchor, "-sr"])
+    guard rules.status == 0 else { return false }
+    return rules.output.contains("block drop out quick all")
+}
+
+private func installKillSwitchBootDaemon() -> Bool {
+    guard let data = try? TunHelperPlists.killSwitchBootDaemonPlistData() else { return false }
+    return writeRootFileAtomically(data, to: TunHelperPaths.killSwitchDaemonPlistPath)
+}
+
+private func removeKillSwitchBootDaemon() {
+    _ = runLaunchctl(["bootout", TunHelperPaths.killSwitchServiceTarget])
+    _ = unlink(TunHelperPaths.killSwitchDaemonPlistPath)
+}
+
+private func enableKillSwitch(allowLAN: Bool, persistOnBoot: Bool) -> Int32 {
+    guard geteuid() == 0 else {
+        writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
+        return 77
+    }
+    guard verifyAuthorizedMihomo() else { return 77 }
+    _ = setgid(0)
+    _ = setuid(0)
+
+    let rules = TunHelperPFRules.renderKillSwitchPFConfig(allowLAN: allowLAN)
+    let loadRes = runPfctl(["-a", TunHelperPaths.killSwitchAnchor, "-f", "-"], stdin: rules)
+    guard loadRes.status == 0 else {
+        writeStderr("RouteWeaverTunHelper: failed to load PF kill switch anchor: \(loadRes.output)")
+        return 71
+    }
+
+    let pfAlreadyEnabled = isPFCurrentlyEnabled()
+    let hasSavedToken = readKillSwitchToken() != nil
+    if !pfAlreadyEnabled || !hasSavedToken {
+        let enableRes = runPfctl(["-E"])
+        guard enableRes.status == 0 else {
+            _ = runPfctl(["-a", TunHelperPaths.killSwitchAnchor, "-F", "all"])
+            writeStderr("RouteWeaverTunHelper: failed to enable PF: \(enableRes.output)")
+            return 71
+        }
+        if let token = TunHelperPFRules.parsePFEnableToken(from: enableRes.output) {
+            saveKillSwitchToken(token)
+        }
+    }
+
+    saveKillSwitchState(KillSwitchPersistedState(enabled: true, allowLAN: allowLAN, persistOnBoot: persistOnBoot))
+    if persistOnBoot {
+        _ = installKillSwitchBootDaemon()
+    } else {
+        removeKillSwitchBootDaemon()
+    }
+    return 0
+}
+
+private func disableKillSwitch() -> Int32 {
+    guard geteuid() == 0 else {
+        writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
+        return 77
+    }
+    guard verifyAuthorizedMihomo() else { return 77 }
+    _ = setgid(0)
+    _ = setuid(0)
+
+    _ = runPfctl(["-a", TunHelperPaths.killSwitchAnchor, "-F", "all"])
+    if let token = readKillSwitchToken() {
+        _ = runPfctl(["-X", token])
+        _ = unlink(TunHelperPaths.killSwitchTokenPath)
+    }
+    removeKillSwitchBootDaemon()
+    _ = unlink(TunHelperPaths.killSwitchStatePath)
+    return 0
+}
+
+private func restoreKillSwitchOnBoot() -> Int32 {
+    guard geteuid() == 0 else { return 77 }
+    guard let state = loadKillSwitchState(), state.enabled, state.persistOnBoot else {
+        return 0
+    }
+    _ = unlink(TunHelperPaths.killSwitchTokenPath)
+    return enableKillSwitch(allowLAN: state.allowLAN, persistOnBoot: true)
+}
+
+private func queryKillSwitchStatus() -> Int32 {
+    guard geteuid() == 0 else {
+        writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
+        return 77
+    }
+    _ = setgid(0)
+    _ = setuid(0)
+
+    let pfEnabled = isPFCurrentlyEnabled()
+    let anchorLoaded = isKillSwitchAnchorLoaded()
+    let persisted = loadKillSwitchState()
+    let report = KillSwitchStatusReport(
+        isActive: pfEnabled && anchorLoaded,
+        allowLAN: persisted?.allowLAN ?? true,
+        persistOnBoot: persisted?.persistOnBoot ?? false,
+        isPFEnabled: pfEnabled
+    )
+    let bytes = Array((report.encodeText() + "\n").utf8)
+    _ = bytes.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
+    return 0
+}
+
+// MARK: - Main Entrypoint
+
+private func runMihomo(
+    workDir: String,
+    configPath: String,
+    logFilePath: String?,
+    pidFilePath: String?,
+    gatewayMode: Bool,
+    daemonRunMode: Bool
+) -> Int32 {
+    guard geteuid() == 0 else {
+        writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
+        return 77
+    }
+    guard verifyAuthorizedMihomo() else { return 77 }
 
     var cfgStat = stat()
     guard stat(configPath, &cfgStat) == 0, (cfgStat.st_mode & S_IFMT) == S_IFREG else {
@@ -497,40 +706,36 @@ private func runHelper() -> Int32 {
 
     _ = signal(SIGPIPE, SIG_IGN)
     _ = signal(SIGHUP, SIG_IGN)
-    _ = setgid(0)
+    var dedicatedGroups: [gid_t] = [TunHelperPaths.mihomoDedicatedGid]
+    _ = setgroups(1, &dedicatedGroups)
+    _ = setgid(TunHelperPaths.mihomoDedicatedGid)
     _ = setuid(0)
-    _ = setsid()
+    if !daemonRunMode {
+        _ = setsid()
+    }
 
     if gatewayMode {
-        guard enableGatewaySysctl() else {
-            return 71
-        }
+        guard enableGatewaySysctl() else { return 71 }
     }
     defer {
-        if gatewayMode {
-            restoreGatewaySysctlIfNeeded()
-        }
+        if gatewayMode { restoreGatewaySysctlIfNeeded() }
     }
 
-    // Block SIGTERM/SIGINT so kqueue EVFILT_SIGNAL receives them synchronously
     var sigset = sigset_t()
     sigemptyset(&sigset)
     sigaddset(&sigset, SIGTERM)
     sigaddset(&sigset, SIGINT)
     _ = sigprocmask(SIG_BLOCK, &sigset, nil)
 
-    // Spawn Mihomo with stdin redirected to /dev/null so this helper exclusively owns STDIN_FILENO
     var fileActions: posix_spawn_file_actions_t?
     posix_spawn_file_actions_init(&fileActions)
     defer { posix_spawn_file_actions_destroy(&fileActions) }
     posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
     if let logFilePath {
-        // Redirect stdout/stderr to a regular log file so Mihomo survives parent UI exit without SIGPIPE
         posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, logFilePath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
         posix_spawn_file_actions_adddup2(&fileActions, STDOUT_FILENO, STDERR_FILENO)
     }
 
-    // Reset signal mask for child so Mihomo receives SIGTERM normally
     var spawnAttr: posix_spawnattr_t?
     posix_spawnattr_init(&spawnAttr)
     defer { posix_spawnattr_destroy(&spawnAttr) }
@@ -539,12 +744,11 @@ private func runHelper() -> Int32 {
     posix_spawnattr_setsigmask(&spawnAttr, &emptySet)
     posix_spawnattr_setflags(&spawnAttr, Int16(POSIX_SPAWN_SETSIGMASK))
 
-    let argvStrings = [authorizedMihomoPath, "-d", workDir, "-f", configPath]
+    let argvStrings = [TunHelperPaths.authorizedMihomoPath, "-d", workDir, "-f", configPath]
     let envStrings = [
         "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME=\(workDir)",
     ]
-
     let cArgv: [UnsafeMutablePointer<CChar>?] = argvStrings.map { strdup($0) } + [nil]
     let cEnv: [UnsafeMutablePointer<CChar>?] = envStrings.map { strdup($0) } + [nil]
     defer {
@@ -553,7 +757,7 @@ private func runHelper() -> Int32 {
     }
 
     var childPid: pid_t = 0
-    let spawnErr = posix_spawn(&childPid, authorizedMihomoPath, &fileActions, &spawnAttr, cArgv, cEnv)
+    let spawnErr = posix_spawn(&childPid, TunHelperPaths.authorizedMihomoPath, &fileActions, &spawnAttr, cArgv, cEnv)
     guard spawnErr == 0, childPid > 0 else {
         writeStderr("RouteWeaverTunHelper: posix_spawn failed with errno \(spawnErr)")
         return 71
@@ -564,12 +768,9 @@ private func runHelper() -> Int32 {
     }
     defer {
         restoreSystemDNSIfNeeded()
-        if let pidFilePath {
-            _ = unlink(pidFilePath)
-        }
+        if let pidFilePath { _ = unlink(pidFilePath) }
     }
 
-    // Give Mihomo a brief moment to initialize TUN; if it already exited, skip DNS takeover.
     usleep(250_000)
     var earlyStatus: Int32 = 0
     if waitpid(childPid, &earlyStatus, WNOHANG) == childPid {
@@ -596,14 +797,6 @@ private func runHelper() -> Int32 {
             udata: nil
         ),
         kevent(
-            ident: UInt(STDIN_FILENO),
-            filter: Int16(EVFILT_READ),
-            flags: UInt16(EV_ADD | EV_ENABLE),
-            fflags: 0,
-            data: 0,
-            udata: nil
-        ),
-        kevent(
             ident: UInt(SIGTERM),
             filter: Int16(EVFILT_SIGNAL),
             flags: UInt16(EV_ADD | EV_ENABLE),
@@ -620,12 +813,23 @@ private func runHelper() -> Int32 {
             udata: nil
         ),
     ]
+    if !daemonRunMode {
+        changes.append(
+            kevent(
+                ident: UInt(STDIN_FILENO),
+                filter: Int16(EVFILT_READ),
+                flags: UInt16(EV_ADD | EV_ENABLE),
+                fflags: 0,
+                data: 0,
+                udata: nil
+            )
+        )
+    }
 
     let regResult = changes.withUnsafeMutableBufferPointer { buf in
         kevent(kq, buf.baseAddress, Int32(buf.count), nil, 0, nil)
     }
     if regResult < 0 {
-        // Child may have already exited before EVFILT_PROC registration
         var status: Int32 = 0
         if waitpid(childPid, &status, WNOHANG) == childPid {
             return exitCode(from: status)
@@ -652,7 +856,6 @@ private func runHelper() -> Int32 {
             var buf = [UInt8](repeating: 0, count: 64)
             let bytesRead = Darwin.read(STDIN_FILENO, &buf, buf.count)
             if bytesRead <= 0 {
-                // Parent UI exited or detached; stop watching stdin and keep Mihomo running in the background.
                 var removeStdin = kevent(
                     ident: UInt(STDIN_FILENO),
                     filter: Int16(EVFILT_READ),
@@ -675,6 +878,55 @@ private func runHelper() -> Int32 {
         default:
             break
         }
+    }
+}
+
+private func runHelper() -> Int32 {
+    let command: TunHelperCommand
+    do {
+        command = try TunHelperCommand.parse(Array(CommandLine.arguments.dropFirst()))
+    } catch let error as TunHelperCommandError {
+        writeStderr(error.message)
+        return 64
+    } catch {
+        writeStderr("RouteWeaverTunHelper: \(error.localizedDescription)")
+        return 64
+    }
+
+    switch command {
+    case .version:
+        let out = Array("RouteWeaverTunHelper \(TunHelperPaths.helperVersion)\n".utf8)
+        _ = out.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
+        return 0
+    case .killSwitchStatus:
+        return queryKillSwitchStatus()
+    case .killSwitchEnable(let allowLAN, let persistOnBoot):
+        return enableKillSwitch(allowLAN: allowLAN, persistOnBoot: persistOnBoot)
+    case .killSwitchDisable:
+        return disableKillSwitch()
+    case .killSwitchRestore:
+        return restoreKillSwitchOnBoot()
+    case .uninstallDaemon:
+        return uninstallTunDaemon()
+    case .installDaemon(let workDir, let configPath, let logFilePath, let pidFilePath, let gatewayMode):
+        return installTunDaemon(
+            workDir: workDir,
+            configPath: configPath,
+            logFilePath: logFilePath,
+            pidFilePath: pidFilePath,
+            gatewayMode: gatewayMode
+        )
+    case .stopPid(let pid):
+        return stopAuthorizedPid(pid)
+    case .run(let workDir, let configPath, let logFilePath, let pidFilePath, let gatewayMode, let daemonRunMode):
+        return runMihomo(
+            workDir: workDir,
+            configPath: configPath,
+            logFilePath: logFilePath,
+            pidFilePath: pidFilePath,
+            gatewayMode: gatewayMode,
+            daemonRunMode: daemonRunMode
+        )
     }
 }
 
