@@ -109,6 +109,8 @@ struct MainView: View {
             OverviewView(state: state, liveProxyStore: state.liveProxyStore)
         case .monitor:
             RequestMonitorView(state: state, monitor: state.connectionMonitor)
+        case .trafficStats:
+            TrafficStatsView(state: state, monitor: state.connectionMonitor)
         case .ruleGroups:
             RuleGroupsView(state: state)
         case .customDNS:

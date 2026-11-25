@@ -328,6 +328,7 @@ public struct ConnectionTracker: Sendable {
     public private(set) var lastUploadDelta: Int64 = 0
     public private(set) var lastDownloadDelta: Int64 = 0
     public private(set) var lastTargetDeltas: [String: TrafficBytes] = [:]
+    public private(set) var lastDimensionDeltas = TrafficDimensionDeltas()
     public private(set) var targetSpeeds: [String: TrafficBytes] = [:]
     public private(set) var memoryUsage: Int64 = 0
     public private(set) var lastSnapshotAt: Date?
@@ -484,6 +485,9 @@ public struct ConnectionTracker: Sendable {
         var seenActiveIDs = Set<String>()
         seenActiveIDs.reserveCapacity(snapshot.connections.count)
         var currentTargetDeltas: [String: TrafficBytes] = [:]
+        var dimensionDeltas = TrafficDimensionDeltas()
+        var innerUpDelta: Int64 = 0
+        var innerDownDelta: Int64 = 0
 
         for conn in snapshot.connections {
             seenActiveIDs.insert(conn.id)
@@ -501,7 +505,10 @@ public struct ConnectionTracker: Sendable {
                     existing.uploadSpeed = 0
                     existing.downloadSpeed = 0
                 }
-                if !isInnerConn && (connUpDelta > 0 || connDownDelta > 0) {
+                if isInnerConn {
+                    innerUpDelta += connUpDelta
+                    innerDownDelta += connDownDelta
+                } else if connUpDelta > 0 || connDownDelta > 0 {
                     var deltaAcc = currentTargetDeltas[targetName] ?? .zero
                     deltaAcc.add(upload: connUpDelta, download: connDownDelta)
                     currentTargetDeltas[targetName] = deltaAcc
@@ -509,6 +516,15 @@ public struct ConnectionTracker: Sendable {
                     var sessionAcc = sessionTargetTotals[targetName] ?? .zero
                     sessionAcc.add(upload: connUpDelta, download: connDownDelta)
                     sessionTargetTotals[targetName] = sessionAcc
+
+                    let attr = TrafficAttribution.extract(from: conn.metadata)
+                    dimensionDeltas.add(
+                        domain: attr.domain,
+                        ip: attr.ip,
+                        process: attr.process,
+                        upload: connUpDelta,
+                        download: connDownDelta
+                    )
                 }
                 existing.metadata = conn.metadata
                 existing.upload = conn.upload
@@ -523,7 +539,10 @@ public struct ConnectionTracker: Sendable {
             } else {
                 let connUpDelta = max(0, conn.upload)
                 let connDownDelta = max(0, conn.download)
-                if !isInnerConn {
+                if isInnerConn {
+                    innerUpDelta += connUpDelta
+                    innerDownDelta += connDownDelta
+                } else {
                     sessionTargetConnectionCounts[targetName, default: 0] += 1
                     if connUpDelta > 0 || connDownDelta > 0 {
                         var deltaAcc = currentTargetDeltas[targetName] ?? .zero
@@ -533,6 +552,15 @@ public struct ConnectionTracker: Sendable {
                         var sessionAcc = sessionTargetTotals[targetName] ?? .zero
                         sessionAcc.add(upload: connUpDelta, download: connDownDelta)
                         sessionTargetTotals[targetName] = sessionAcc
+
+                        let attr = TrafficAttribution.extract(from: conn.metadata)
+                        dimensionDeltas.add(
+                            domain: attr.domain,
+                            ip: attr.ip,
+                            process: attr.process,
+                            upload: connUpDelta,
+                            download: connDownDelta
+                        )
                     }
                 }
                 recordsByID[conn.id] = MonitoredConnection(
@@ -555,7 +583,50 @@ public struct ConnectionTracker: Sendable {
             }
         }
 
+        var newlyClosedWeights: [String: TrafficBytes] = [:]
+        for id in recordsByID.keys where !seenActiveIDs.contains(id) {
+            if var item = recordsByID[id], item.isActive {
+                item.isActive = false
+                item.closedAt = now
+                item.uploadSpeed = 0
+                item.downloadSpeed = 0
+                recordsByID[id] = item
+                if !item.isInner {
+                    let target = item.primaryTarget
+                    var w = newlyClosedWeights[target] ?? .zero
+                    w.add(upload: max(1, item.upload), download: max(1, item.download))
+                    newlyClosedWeights[target] = w
+                }
+            }
+        }
+
+        // Recover traffic from connections that closed between 1s WebSocket snapshots.
+        if hadPrevious {
+            let activeUp = currentTargetDeltas.values.reduce(Int64(0)) { $0 + $1.upload }
+            let activeDown = currentTargetDeltas.values.reduce(Int64(0)) { $0 + $1.download }
+            let unattributedUp = max(0, upDelta - activeUp - innerUpDelta)
+            let unattributedDown = max(0, downDelta - activeDown - innerDownDelta)
+            if unattributedUp > 0 || unattributedDown > 0 {
+                Self.distributeUnattributed(
+                    upload: unattributedUp,
+                    download: unattributedDown,
+                    newlyClosedWeights: newlyClosedWeights,
+                    activeDeltas: currentTargetDeltas,
+                    intoDeltas: &currentTargetDeltas,
+                    sessionTotals: &sessionTargetTotals
+                )
+                dimensionDeltas.add(
+                    domain: TrafficAttribution.unknownLabel,
+                    ip: TrafficAttribution.unknownLabel,
+                    process: TrafficAttribution.unknownLabel,
+                    upload: unattributedUp,
+                    download: unattributedDown
+                )
+            }
+        }
+
         lastTargetDeltas = currentTargetDeltas
+        lastDimensionDeltas = dimensionDeltas
 
         var computedTargetSpeeds: [String: TrafficBytes] = [:]
         if let dt = elapsed {
@@ -585,17 +656,81 @@ public struct ConnectionTracker: Sendable {
             targetSpeedTimeline.removeFirst(targetSpeedTimeline.count - maxSpeedSamples)
         }
 
-        for id in recordsByID.keys where !seenActiveIDs.contains(id) {
-            if var item = recordsByID[id], item.isActive {
-                item.isActive = false
-                item.closedAt = now
-                item.uploadSpeed = 0
-                item.downloadSpeed = 0
-                recordsByID[id] = item
-            }
-        }
-
         trimClosedHistoryIfNeeded()
+    }
+
+    private static func distributeUnattributed(
+        upload: Int64,
+        download: Int64,
+        newlyClosedWeights: [String: TrafficBytes],
+        activeDeltas: [String: TrafficBytes],
+        intoDeltas deltas: inout [String: TrafficBytes],
+        sessionTotals: inout [String: TrafficBytes]
+    ) {
+        var weights: [String: TrafficBytes] = newlyClosedWeights
+        for (target, active) in activeDeltas {
+            var existing = weights[target] ?? .zero
+            existing.add(upload: active.upload, download: active.download)
+            weights[target] = existing
+        }
+        guard !weights.isEmpty else { return }
+
+        if upload > 0 {
+            distributeAmount(
+                upload,
+                weights: weights.mapValues(\.upload),
+                isUpload: true,
+                intoDeltas: &deltas,
+                sessionTotals: &sessionTotals
+            )
+        }
+        if download > 0 {
+            distributeAmount(
+                download,
+                weights: weights.mapValues(\.download),
+                isUpload: false,
+                intoDeltas: &deltas,
+                sessionTotals: &sessionTotals
+            )
+        }
+    }
+
+    private static func distributeAmount(
+        _ amount: Int64,
+        weights: [String: Int64],
+        isUpload: Bool,
+        intoDeltas deltas: inout [String: TrafficBytes],
+        sessionTotals: inout [String: TrafficBytes]
+    ) {
+        let positive = weights.filter { $0.value > 0 }
+        let candidates = positive.isEmpty ? weights.mapValues { _ in Int64(1) } : positive
+        let totalWeight = candidates.values.reduce(Int64(0), +)
+        guard totalWeight > 0 else { return }
+
+        var remaining = amount
+        let sorted = candidates.sorted {
+            if $0.value != $1.value { return $0.value > $1.value }
+            return $0.key < $1.key
+        }
+        for (index, entry) in sorted.enumerated() {
+            let share: Int64
+            if index == sorted.count - 1 {
+                share = remaining
+            } else {
+                share = Int64((Double(amount) * Double(entry.value) / Double(totalWeight)).rounded(.down))
+                remaining -= share
+            }
+            guard share > 0 else { continue }
+            let up = isUpload ? share : 0
+            let down = isUpload ? 0 : share
+            var deltaAcc = deltas[entry.key] ?? .zero
+            deltaAcc.add(upload: up, download: down)
+            deltas[entry.key] = deltaAcc
+
+            var sessionAcc = sessionTotals[entry.key] ?? .zero
+            sessionAcc.add(upload: up, download: down)
+            sessionTotals[entry.key] = sessionAcc
+        }
     }
 
     public mutating func markAllClosed(at now: Date = Date()) {
@@ -627,6 +762,7 @@ public struct ConnectionTracker: Sendable {
         lastUploadDelta = 0
         lastDownloadDelta = 0
         lastTargetDeltas.removeAll()
+        lastDimensionDeltas = TrafficDimensionDeltas()
         targetSpeeds.removeAll()
         memoryUsage = 0
         lastSnapshotAt = nil

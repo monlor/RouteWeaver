@@ -6,6 +6,7 @@ import RoutingCore
 final class ConnectionMonitorService: ObservableObject {
     @Published private(set) var tracker = ConnectionTracker()
     @Published private(set) var trafficHistory = TrafficHistoryAccumulator()
+    @Published private(set) var trafficRanking = TrafficRankingAccumulator()
     @Published private(set) var dnsTracker = DNSLogTracker(maxRecords: 500)
     @Published var isPaused = false
     @Published private(set) var isStreaming = false
@@ -43,11 +44,18 @@ final class ConnectionMonitorService: ObservableObject {
         }
         historyDirectory = normalized
         trafficHistory = Self.loadHistory(in: normalized)
+        trafficRanking = Self.loadRanking(in: normalized)
         hasUnsavedHistory = false
     }
 
     func clearTrafficHistory() {
         trafficHistory.reset()
+        hasUnsavedHistory = true
+        flushHistory()
+    }
+
+    func clearTrafficRanking() {
+        trafficRanking.reset()
         hasUnsavedHistory = true
         flushHistory()
     }
@@ -62,16 +70,19 @@ final class ConnectionMonitorService: ObservableObject {
     func flushHistory(sync: Bool = false) {
         guard hasUnsavedHistory else { return }
         let snapshot = trafficHistory
+        let rankingSnapshot = trafficRanking
         let directory = historyDirectory
         hasUnsavedHistory = false
         lastHistorySaveAt = Date()
         if sync {
             historyPersistenceQueue.sync {
                 Self.saveHistory(snapshot, in: directory)
+                Self.saveRanking(rankingSnapshot, in: directory)
             }
         } else {
             historyPersistenceQueue.async {
                 Self.saveHistory(snapshot, in: directory)
+                Self.saveRanking(rankingSnapshot, in: directory)
             }
         }
     }
@@ -197,9 +208,13 @@ final class ConnectionMonitorService: ObservableObject {
                 at: now
             )
             hasUnsavedHistory = true
-            if now.timeIntervalSince(lastHistorySaveAt) >= 15 {
-                flushHistory()
-            }
+        }
+        if !internalTracker.lastDimensionDeltas.isEmpty {
+            trafficRanking.record(internalTracker.lastDimensionDeltas, at: now)
+            hasUnsavedHistory = true
+        }
+        if hasUnsavedHistory && now.timeIntervalSince(lastHistorySaveAt) >= 15 {
+            flushHistory()
         }
         if !isPaused {
             tracker = internalTracker
@@ -239,6 +254,36 @@ final class ConnectionMonitorService: ObservableObject {
         let attrs: [FileAttributeKey: Any]? = isDefault ? [.posixPermissions: 0o700] : nil
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: attrs)
         try? ProfileStore.writePrivateFile(data, to: targetURL, tempName: "traffic-history.json")
+    }
+
+    private nonisolated static func rankingURL(in directory: URL) -> URL {
+        directory.standardizedFileURL.appendingPathComponent("traffic-ranking.json")
+    }
+
+    private nonisolated static func loadRanking(in directory: URL) -> TrafficRankingAccumulator {
+        let primary = rankingURL(in: directory)
+        if let data = try? Data(contentsOf: primary),
+           let decoded = try? JSONDecoder().decode(TrafficRankingAccumulator.self, from: data) {
+            return decoded
+        }
+        if directory.standardizedFileURL != defaultDirectory.standardizedFileURL {
+            let fallback = rankingURL(in: defaultDirectory)
+            if let data = try? Data(contentsOf: fallback),
+               let decoded = try? JSONDecoder().decode(TrafficRankingAccumulator.self, from: data) {
+                return decoded
+            }
+        }
+        return TrafficRankingAccumulator()
+    }
+
+    private nonisolated static func saveRanking(_ ranking: TrafficRankingAccumulator, in directory: URL) {
+        guard let data = try? JSONEncoder().encode(ranking) else { return }
+        let targetURL = rankingURL(in: directory)
+        let dir = targetURL.deletingLastPathComponent()
+        let isDefault = directory.standardizedFileURL == defaultDirectory.standardizedFileURL
+        let attrs: [FileAttributeKey: Any]? = isDefault ? [.posixPermissions: 0o700] : nil
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: attrs)
+        try? ProfileStore.writePrivateFile(data, to: targetURL, tempName: "traffic-ranking.json")
     }
 
     private func enqueueDNS(_ record: DNSLogRecord) {

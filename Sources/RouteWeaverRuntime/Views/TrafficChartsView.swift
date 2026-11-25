@@ -314,6 +314,9 @@ struct TrafficOverviewCard: View {
                     Button("前往请求监控") {
                         state.selectedSection = .monitor
                     }
+                    Button("查看流量排行") {
+                        state.selectedSection = .trafficStats
+                    }
                     if selectedTarget != nil {
                         Button("重置为全部目标") {
                             selectedTarget = nil

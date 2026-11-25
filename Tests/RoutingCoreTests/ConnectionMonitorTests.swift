@@ -700,4 +700,34 @@ final class ConnectionMonitorTests: XCTestCase {
         )
         XCTAssertEqual(resolved, ResolvedRelayChain(relayGroupName: expectedGroup, relayNode: "HK-Relay-01"))
     }
+
+    func testUnattributedDeltaFromClosedConnectionsIsRecoveredIntoTargetTotals() {
+        var tracker = ConnectionTracker(maxClosedHistory: 10, maxSpeedSamples: 10)
+        let t0 = Date(timeIntervalSince1970: 1_795_000_000)
+        let t1 = t0.addingTimeInterval(1)
+
+        let esimConn = MihomoConnection(
+            id: "esim-1",
+            metadata: MihomoConnectionMetadata(type: "Tun", host: "api2.cursor.sh"),
+            upload: 1_000,
+            download: 200,
+            start: "",
+            chains: ["新加坡eSIM"],
+            rule: "RuleSet",
+            rulePayload: "ai"
+        )
+        tracker.ingest(
+            MihomoConnectionsSnapshot(downloadTotal: 200, uploadTotal: 1_000, connections: [esimConn]),
+            at: t0
+        )
+
+        // Between t0 and t1, esim-1 uploaded another 5_000 bytes and closed before t1 snapshot
+        tracker.ingest(
+            MihomoConnectionsSnapshot(downloadTotal: 700, uploadTotal: 6_000, connections: []),
+            at: t1
+        )
+
+        XCTAssertEqual(tracker.lastTargetDeltas["新加坡eSIM"], TrafficBytes(upload: 5_000, download: 500))
+        XCTAssertEqual(tracker.sessionTraffic(for: "新加坡eSIM"), TrafficBytes(upload: 6_000, download: 700))
+    }
 }

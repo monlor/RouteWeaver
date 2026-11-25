@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 enum SidebarSection: String, CaseIterable, Identifiable {
     case overview
     case monitor
+    case trafficStats
     case ruleGroups
     case customDNS
     case targets
@@ -20,6 +21,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview: return "总览"
         case .monitor: return "请求监控"
+        case .trafficStats: return "流量统计"
         case .ruleGroups: return "规则组"
         case .customDNS: return "自定义 DNS"
         case .targets: return "网络目标"
@@ -32,6 +34,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         switch self {
         case .overview: return "gauge.with.dots.needle.33percent"
         case .monitor: return "waveform.path.ecg"
+        case .trafficStats: return "chart.bar.xaxis"
         case .ruleGroups: return "list.bullet.rectangle.portrait"
         case .customDNS: return "globe"
         case .targets: return "point.topleft.down.to.point.bottomright.curvepath"
@@ -828,7 +831,7 @@ final class AppState: ObservableObject {
         do {
             let rendered = try MihomoConfig.renderDetailed(
                 profile,
-                interfaceDNS: NetworkEnvironment.interfaceDNSServers()
+                interfaceDNS: NetworkEnvironment.interfaceDNSServers(includeIPv6: profile.ipv6Enabled)
             )
             engine.validate(config: rendered.data, binary: binary)
             showFeedback("已开始校验配置…")
@@ -846,7 +849,7 @@ final class AppState: ObservableObject {
                 profile,
                 controllerPort: controllerPort,
                 secret: secret,
-                interfaceDNS: NetworkEnvironment.interfaceDNSServers()
+                interfaceDNS: NetworkEnvironment.interfaceDNSServers(includeIPv6: profile.ipv6Enabled)
             )
             let active = liveProxyStore.makeClient(
                 port: controllerPort,
@@ -892,7 +895,7 @@ final class AppState: ObservableObject {
                 snapshot,
                 controllerPort: active.port,
                 secret: active.secret,
-                interfaceDNS: NetworkEnvironment.interfaceDNSServers()
+                interfaceDNS: NetworkEnvironment.interfaceDNSServers(includeIPv6: snapshot.ipv6Enabled)
             )
         } catch {
             alertText = "热重载失败：\(error.localizedDescription)"
@@ -1257,7 +1260,10 @@ final class AppState: ObservableObject {
     func exportConfig() {
         let config: Data
         do {
-            config = try MihomoConfig.render(profile, interfaceDNS: NetworkEnvironment.interfaceDNSServers())
+            config = try MihomoConfig.render(
+                profile,
+                interfaceDNS: NetworkEnvironment.interfaceDNSServers(includeIPv6: profile.ipv6Enabled)
+            )
         } catch {
             alertText = error.localizedDescription
             return

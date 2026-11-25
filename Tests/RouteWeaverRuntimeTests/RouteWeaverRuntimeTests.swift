@@ -1,6 +1,8 @@
+import AppKit
 import Foundation
 import RoutingCore
 @testable import RouteWeaverRuntime
+import SwiftUI
 import XCTest
 
 // MARK: - Test Adapters
@@ -367,5 +369,71 @@ final class RouteWeaverRuntimeTests: XCTestCase {
         )
         let tested = await waitUntil { client.testedGroups == ["HK"] && !store.testingGroups.contains("HK") }
         XCTAssertTrue(tested)
+    }
+
+    func testConnectionMonitorPersistsTrafficRankingAndTrafficStatsViewRenders() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rw-ranking-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let client = FakeMihomoControlClient()
+        client.streamSnapshots = [
+            MihomoConnectionsSnapshot(
+                downloadTotal: 4096,
+                uploadTotal: 1024,
+                memory: 2048,
+                connections: [
+                    MihomoConnection(
+                        id: "r-1",
+                        metadata: MihomoConnectionMetadata(
+                            network: "tcp",
+                            type: "HTTP Connect",
+                            destinationIP: "140.82.114.4",
+                            destinationPort: "443",
+                            host: "github.com",
+                            process: "git"
+                        ),
+                        upload: 1024,
+                        download: 4096,
+                        start: "2026-11-25T12:00:00Z",
+                        chains: ["DIRECT"],
+                        rule: "DOMAIN",
+                        rulePayload: "github.com"
+                    )
+                ]
+            )
+        ]
+
+        let monitor = ConnectionMonitorService(initialConnectDelayNs: 0, reconnectDelayNs: 50_000_000)
+        monitor.configureHistory(directory: dir)
+        monitor.start(controller: client)
+
+        let recorded = await waitUntil {
+            !monitor.trafficRanking.report(dimension: .domain, window: .today).items.isEmpty
+        }
+        XCTAssertTrue(recorded)
+        monitor.stop()
+
+        let rankingFile = dir.appendingPathComponent("traffic-ranking.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rankingFile.path))
+
+        // Reload into a fresh ConnectionMonitorService instance
+        let reloaded = ConnectionMonitorService(initialConnectDelayNs: 0, reconnectDelayNs: 50_000_000)
+        reloaded.configureHistory(directory: dir)
+        let domainReport = reloaded.trafficRanking.report(dimension: .domain, window: .today)
+        XCTAssertEqual(domainReport.items.first?.key, "github.com")
+        XCTAssertEqual(domainReport.items.first?.total, 5120)
+
+        // Render TrafficStatsView in NSHostingView to verify SwiftUI layout builds cleanly
+        let appState = AppState()
+        let statsView = TrafficStatsView(state: appState, monitor: reloaded)
+        let hosting = NSHostingView(rootView: statsView)
+        hosting.frame = NSRect(x: 0, y: 0, width: 960, height: 640)
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(hosting.fittingSize.width, 0)
+
+        reloaded.clearTrafficRanking()
+        XCTAssertTrue(reloaded.trafficRanking.report(dimension: .domain, window: .today).items.isEmpty)
     }
 }
