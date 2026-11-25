@@ -1615,4 +1615,23 @@ final class RoutingCoreTests: XCTestCase {
         let policy = try XCTUnwrap(customDNS["nameserver-policy"] as? [String: [String]])
         XCTAssertEqual(policy["example.com"], ["[2606:4700:4700::1111]#新加坡eSIM"])
     }
+
+    func testGeositeCNIsolatedToDirectDNSWhenMatchIsProxy() throws {
+        let sub = ProxySubscription(name: "Sub", url: exitSubURL, role: .general)
+        let hkGroup = NodeGroup(name: "香港出口", kind: .exit, subscriptionID: sub.id, filterPattern: "HK", autoTest: true)
+        let hkTarget = NetworkTarget(name: "香港", mode: .proxy, exitGroupID: hkGroup.id)
+        let directTarget = NetworkTarget(name: "默认", mode: .direct, interfaceName: "en0")
+        let profile = RoutingProfile(
+            subscriptions: [sub],
+            nodeGroups: [hkGroup],
+            targets: [directTarget, hkTarget],
+            ruleGroups: [],
+            fallbackTarget: .target(hkTarget.id)
+        )
+
+        let config = try decodeJSON(try MihomoConfig.render(profile, interfaceDNS: ["en0": ["192.168.100.1"]]))
+        let dns = try XCTUnwrap(config["dns"] as? [String: Any])
+        let policy = try XCTUnwrap(dns["nameserver-policy"] as? [String: [String]])
+        XCTAssertEqual(policy["geosite:cn"], ["system", "223.5.5.5", "119.29.29.29"])
+    }
 }

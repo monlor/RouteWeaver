@@ -243,7 +243,7 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
     }
 
     func connections() async throws -> MihomoConnectionsSnapshot {
-        let data = try await request(path: "/connections")
+        let data = try await request(path: "/connections", timeout: 5)
         return try JSONDecoder().decode(MihomoConnectionsSnapshot.self, from: data)
     }
 
@@ -267,13 +267,13 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
     }
 
     func connectionSnapshots() -> AsyncThrowingStream<MihomoConnectionsSnapshot, Error> {
-        webSocketStream(path: "/connections", queryItems: nil) { data in
+        webSocketStream(path: "/connections", queryItems: nil, idleTimeout: 6) { data in
             try? JSONDecoder().decode(MihomoConnectionsSnapshot.self, from: data)
         }
     }
 
     func dnsLogRecords(level: String = "debug") -> AsyncThrowingStream<DNSLogRecord, Error> {
-        webSocketStream(path: "/logs", queryItems: [URLQueryItem(name: "level", value: level)]) { data in
+        webSocketStream(path: "/logs", queryItems: [URLQueryItem(name: "level", value: level)], idleTimeout: 60) { data in
             guard let envelope = try? JSONDecoder().decode(MihomoLogEnvelope.self, from: data),
                   let payload = envelope.payload else {
                 return nil
@@ -284,9 +284,12 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
 
     // MARK: - Transport Internals
 
+    private static let webSocketMaxMessageSize = 16 * 1024 * 1024
+
     private func webSocketStream<Element: Sendable>(
         path: String,
         queryItems: [URLQueryItem]?,
+        idleTimeout: TimeInterval? = nil,
         decode: @escaping @Sendable (Data) -> Element?
     ) -> AsyncThrowingStream<Element, Error> {
         let port = self.port
@@ -311,6 +314,7 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
 
                 let session = URLSession(configuration: Self.makeDirectSessionConfiguration())
                 let wsTask = session.webSocketTask(with: request)
+                wsTask.maximumMessageSize = Self.webSocketMaxMessageSize
                 wsTask.resume()
 
                 defer {
@@ -320,12 +324,11 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
 
                 do {
                     while !Task.isCancelled {
-                        let message = try await withTaskCancellationHandler {
-                            try await wsTask.receive()
-                        } onCancel: {
-                            wsTask.cancel(with: .normalClosure, reason: nil)
-                            session.invalidateAndCancel()
-                        }
+                        let message = try await Self.receiveMessage(
+                            from: wsTask,
+                            session: session,
+                            idleTimeout: idleTimeout
+                        )
                         let payloadData: Data
                         switch message {
                         case .data(let data):
@@ -350,6 +353,101 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
             }
             continuation.onTermination = { _ in
                 task.cancel()
+            }
+        }
+    }
+
+    private final class WebSocketReceiveState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+        private var pendingResult: Result<URLSessionWebSocketTask.Message, Error>?
+        private var timeoutTask: Task<Void, Never>?
+        private var isResolved = false
+
+        func install(continuation: CheckedContinuation<URLSessionWebSocketTask.Message, Error>) {
+            lock.lock()
+            if let result = pendingResult {
+                pendingResult = nil
+                lock.unlock()
+                continuation.resume(with: result)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func installTimeout(_ task: Task<Void, Never>) {
+            lock.lock()
+            if isResolved {
+                lock.unlock()
+                task.cancel()
+                return
+            }
+            timeoutTask = task
+            lock.unlock()
+        }
+
+        @discardableResult
+        func resolve(with result: Result<URLSessionWebSocketTask.Message, Error>) -> Bool {
+            lock.lock()
+            guard !isResolved else {
+                lock.unlock()
+                return false
+            }
+            isResolved = true
+            let cont = continuation
+            continuation = nil
+            let timer = timeoutTask
+            timeoutTask = nil
+            if cont != nil {
+                lock.unlock()
+                timer?.cancel()
+                cont?.resume(with: result)
+                return true
+            }
+            pendingResult = result
+            lock.unlock()
+            timer?.cancel()
+            return true
+        }
+    }
+
+    /// Races `wsTask.receive` against `idleTimeout` and task cancellation without waiting for
+    /// a wedged `URLSessionWebSocketTask` callback before throwing `streamTimedOut`.
+    private static func receiveMessage(
+        from wsTask: URLSessionWebSocketTask,
+        session: URLSession,
+        idleTimeout: TimeInterval?
+    ) async throws -> URLSessionWebSocketTask.Message {
+        let state = WebSocketReceiveState()
+        let cancelSocket: @Sendable (URLSessionWebSocketTask.CloseCode) -> Void = { closeCode in
+            wsTask.cancel(with: closeCode, reason: nil)
+            session.invalidateAndCancel()
+        }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                state.install(continuation: continuation)
+
+                if let idleTimeout, idleTimeout > 0 {
+                    let timeoutNs = UInt64(idleTimeout * 1_000_000_000)
+                    let timer = Task.detached(priority: .utility) {
+                        try? await Task.sleep(nanoseconds: timeoutNs)
+                        guard !Task.isCancelled else { return }
+                        if state.resolve(with: .failure(ControllerError.streamTimedOut)) {
+                            cancelSocket(.goingAway)
+                        }
+                    }
+                    state.installTimeout(timer)
+                }
+
+                wsTask.receive { result in
+                    state.resolve(with: result)
+                }
+            }
+        } onCancel: {
+            if state.resolve(with: .failure(CancellationError())) {
+                cancelSocket(.normalClosure)
             }
         }
     }
@@ -401,12 +499,13 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
     }
 
     private enum ControllerError: LocalizedError {
-        case invalidAddress, invalidGroup, http(Int)
+        case invalidAddress, invalidGroup, streamTimedOut, http(Int)
 
         var errorDescription: String? {
             switch self {
             case .invalidAddress: return "无法读取本机 Mihomo 控制接口。"
             case .invalidGroup: return "选择的节点组无效。"
+            case .streamTimedOut: return "本机 Mihomo 实时数据流超时。"
             case .http(let code): return "本机 Mihomo 控制接口返回 HTTP \(code)。"
             }
         }

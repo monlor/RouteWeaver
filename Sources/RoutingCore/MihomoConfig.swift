@@ -864,6 +864,11 @@ public enum MihomoConfig {
                 policyMap[entry.key] = entry.servers
             }
         }
+        // Isolate domestic domains from proxy MATCH failures so a proxy outage never breaks CN DNS.
+        if defaultNameserver != directNameserver,
+           seenPolicyKeys.insert("geosite:cn").inserted {
+            policyMap["geosite:cn"] = directNameserver
+        }
 
         let resolvedDefaultBootstrap = customBootstrapServers.isEmpty
             ? bootstrapDNS(interface: sharedBootstrapInterface, interfaceDNS: interfaceDNS, avoidSystemDNS: useTun)

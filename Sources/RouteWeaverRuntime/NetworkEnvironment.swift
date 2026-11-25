@@ -31,7 +31,7 @@ struct NetworkInterfaceInfo: Identifiable, Equatable, Sendable {
 }
 
 enum NetworkEnvironment {
-    static func interfaceDNSServers() -> [String: [String]] {
+    static func interfaceDNSServers(includeIPv6: Bool = true) -> [String: [String]] {
         guard let store = SCDynamicStoreCreate(nil, "RouteWeaver.DNSInspector" as CFString, nil, nil),
               let keys = SCDynamicStoreCopyKeyList(store, "State:/Network/Service/[^/]+/IPv4" as CFString) as? [String] else {
             return [:]
@@ -46,14 +46,20 @@ enum NetworkEnvironment {
                   let servers = dnsDict["ServerAddresses"] as? [String] else { continue }
             let filtered = servers.filter { ip in
                 let lower = ip.lowercased()
-                return !ip.isEmpty
-                    && !ip.hasPrefix("198.18.")
-                    && !ip.hasPrefix("127.")
-                    && ip != "::1"
-                    && !lower.hasPrefix("fe8")
-                    && !lower.hasPrefix("fe9")
-                    && !lower.hasPrefix("fea")
-                    && !lower.hasPrefix("feb")
+                guard !ip.isEmpty,
+                      !ip.hasPrefix("198.18."),
+                      !ip.hasPrefix("127."),
+                      ip != "::1",
+                      !lower.hasPrefix("fe8"),
+                      !lower.hasPrefix("fe9"),
+                      !lower.hasPrefix("fea"),
+                      !lower.hasPrefix("feb") else {
+                    return false
+                }
+                if !includeIPv6 && ip.contains(":") {
+                    return false
+                }
+                return true
             }
             if !filtered.isEmpty {
                 var list = result[iface] ?? []
