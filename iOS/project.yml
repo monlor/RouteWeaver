@@ -1,0 +1,72 @@
+name: RouteWeaveriOS
+options:
+  bundleIdPrefix: com.bytevela
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+  groupSortPosition: top
+
+packages:
+  RouteWeaver:
+    path: ..
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    DEVELOPMENT_TEAM: FHTJ7A4CQS
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  RouteWeaveriOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: RouteWeaveriOS
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bytevela.routeweaver
+        PRODUCT_NAME: RouteWeaver
+        INFOPLIST_FILE: RouteWeaveriOS/Info.plist
+        CODE_SIGN_ENTITLEMENTS: RouteWeaveriOS/RouteWeaveriOS.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - package: RouteWeaver
+        product: RoutingCore
+      - target: PacketTunnelExtension
+        embed: true
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+      - sdk: CoreLocation.framework
+
+  PacketTunnelExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: PacketTunnelExtension
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.bytevela.routeweaver.packet-tunnel
+        PRODUCT_NAME: PacketTunnelExtension
+        INFOPLIST_FILE: PacketTunnelExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PacketTunnelExtension/PacketTunnelExtension.entitlements
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - package: RouteWeaver
+        product: RoutingCore
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+      # Optional Go XCFramework for MihomoKitEngineAdapter (builds cleanly with fallback when omitted):
+      # - framework: Frameworks/MihomoKit.xcframework
+      #   embed: false

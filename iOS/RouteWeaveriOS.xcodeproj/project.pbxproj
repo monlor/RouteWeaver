@@ -1,0 +1,614 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0BE95C29819C3103FA979256 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = E997F0554161F2B2449F3925 /* PacketTunnelProvider.swift */; };
+		0C6CF394ACCAC6CD0B866760 /* PacketTunnelExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 4C92C518699E21842438D7C8 /* PacketTunnelExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		328804BACD128C8400DA900E /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CD350E1054BFD4CBA1107284 /* Network.framework */; };
+		3EFC7E51C387DD059C63C9E4 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CD350E1054BFD4CBA1107284 /* Network.framework */; };
+		43696E6AEA01BAAC167E11DE /* LocalRelayBridgeServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF5EDE4C8284F88E1609BF97 /* LocalRelayBridgeServer.swift */; };
+		4BC4F71CCD7FAB2A0587F2AF /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03CCB67930C52C4F6B0A9E10 /* HomeView.swift */; };
+		50459A1D17C37215C731CD7C /* MonitorAndStatsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FC4C6C582385F6E65BAE0CA /* MonitorAndStatsView.swift */; };
+		508A8AF72BF076217F9878FC /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 912A3F2776D9DD701A30EE59 /* SettingsView.swift */; };
+		57698C957E1F20D02F1C7B02 /* ProxyAndRulesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82ECDBE31F0C5C0294AF8357 /* ProxyAndRulesView.swift */; };
+		704DB0EEFB7FAB35BCCE9385 /* AppGroupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39A9EDD43F868D5F4A6C35A8 /* AppGroupStore.swift */; };
+		73C6BECB36AF4A55C39330C5 /* LumzelRelayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73E8ABBF5C5F0282118C6EF9 /* LumzelRelayClient.swift */; };
+		780483946B3A6F4A8D85AB09 /* NetworkPolicyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E6581E311A0B51B7623A6331 /* NetworkPolicyView.swift */; };
+		7BD70264528DF4733183826D /* MobileRemoteClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63EE07670EEB89C4A6081D06 /* MobileRemoteClient.swift */; };
+		7C23B1F67601DCE06E5CEF1A /* LocalRelayBridgeServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF5EDE4C8284F88E1609BF97 /* LocalRelayBridgeServer.swift */; };
+		8840D52B9ED81E15A3D1A1D9 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BC1A428B2D6A74A7D2DCEE54 /* NetworkExtension.framework */; };
+		8892869656D61D4237E085ED /* RemotePCView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 363D00E0D9F11DDAC98993DA /* RemotePCView.swift */; };
+		8FCF110771F4A5BCA8DFF693 /* MihomoEngineAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1784D8FC4CE314CB50787A58 /* MihomoEngineAdapter.swift */; };
+		90AE9F54F8F9D581B43174B3 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B294CCBCF51595AABF6904E4 /* Assets.xcassets */; };
+		9408C905928C1B1DEAE462D3 /* MobileRemoteClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63EE07670EEB89C4A6081D06 /* MobileRemoteClient.swift */; };
+		A9913386765270B00C65AA5A /* CoreLocation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DD3027759FCEDE4EB99A17C9 /* CoreLocation.framework */; };
+		B2819AF7D99A02E1179A6E17 /* LumzelRelayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73E8ABBF5C5F0282118C6EF9 /* LumzelRelayClient.swift */; };
+		B5C66B314CE6E4DE0347BEC9 /* RoutingCore in Frameworks */ = {isa = PBXBuildFile; productRef = D5F21D43E0827B5CB0C21536 /* RoutingCore */; };
+		C81ED70F4ED7CE60EBAEDC73 /* MihomoEngineAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1784D8FC4CE314CB50787A58 /* MihomoEngineAdapter.swift */; };
+		CA6187C5DBC5F717D54BB0F9 /* RoutingCore in Frameworks */ = {isa = PBXBuildFile; productRef = 4B82D260A80F662EC9DA8A90 /* RoutingCore */; };
+		CC5C7C02F32F53805E4D99D4 /* AppGroupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39A9EDD43F868D5F4A6C35A8 /* AppGroupStore.swift */; };
+		E564CF613A087CCCA9E40043 /* RouteWeaveriOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B33990CD1E6FF1BAD5D1788 /* RouteWeaveriOSApp.swift */; };
+		EBEF24E0EDE20927C2E7112D /* MobileAppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD604ADDBC9D944D2B1C2EC4 /* MobileAppModel.swift */; };
+		EFC12E9612A5A63594672BE4 /* InterfaceRelayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 783EAEBB125A471F583D8DA4 /* InterfaceRelayView.swift */; };
+		F11E7582A8C5A69BB17114C7 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BC1A428B2D6A74A7D2DCEE54 /* NetworkExtension.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B1F338EF6D26665C7AE5675B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 9904469F581EF445E3555ECA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E531021177739FECB01EF111;
+			remoteInfo = PacketTunnelExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		958141986F0096D22EF0EF38 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				0C6CF394ACCAC6CD0B866760 /* PacketTunnelExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		03CCB67930C52C4F6B0A9E10 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		1784D8FC4CE314CB50787A58 /* MihomoEngineAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MihomoEngineAdapter.swift; sourceTree = "<group>"; };
+		363D00E0D9F11DDAC98993DA /* RemotePCView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePCView.swift; sourceTree = "<group>"; };
+		39A9EDD43F868D5F4A6C35A8 /* AppGroupStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGroupStore.swift; sourceTree = "<group>"; };
+		44549E3CB49650EB89C372E8 /* RouteWeaveriOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = RouteWeaveriOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4B33990CD1E6FF1BAD5D1788 /* RouteWeaveriOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RouteWeaveriOSApp.swift; sourceTree = "<group>"; };
+		4C92C518699E21842438D7C8 /* PacketTunnelExtension.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = PacketTunnelExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		63EE07670EEB89C4A6081D06 /* MobileRemoteClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRemoteClient.swift; sourceTree = "<group>"; };
+		73E8ABBF5C5F0282118C6EF9 /* LumzelRelayClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LumzelRelayClient.swift; sourceTree = "<group>"; };
+		783EAEBB125A471F583D8DA4 /* InterfaceRelayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InterfaceRelayView.swift; sourceTree = "<group>"; };
+		82ECDBE31F0C5C0294AF8357 /* ProxyAndRulesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyAndRulesView.swift; sourceTree = "<group>"; };
+		90ABC0B9E1C4A047D6476480 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		912A3F2776D9DD701A30EE59 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		9FC4C6C582385F6E65BAE0CA /* MonitorAndStatsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonitorAndStatsView.swift; sourceTree = "<group>"; };
+		B0DABFFED5866A11B51E7DEB /* RouteWeaver */ = {isa = PBXFileReference; lastKnownFileType = folder; name = RouteWeaver; path = ..; sourceTree = SOURCE_ROOT; };
+		B10D551B8974E9C0A50DC1B7 /* RouteWeaveriOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = RouteWeaveriOS.entitlements; sourceTree = "<group>"; };
+		B294CCBCF51595AABF6904E4 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		BC1A428B2D6A74A7D2DCEE54 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
+		C98532E30200C0F53B5493A0 /* PacketTunnelExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PacketTunnelExtension.entitlements; sourceTree = "<group>"; };
+		CD350E1054BFD4CBA1107284 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+		CF5EDE4C8284F88E1609BF97 /* LocalRelayBridgeServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalRelayBridgeServer.swift; sourceTree = "<group>"; };
+		D827AF5F56DDB37ECA5FB1A4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		DD3027759FCEDE4EB99A17C9 /* CoreLocation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreLocation.framework; path = System/Library/Frameworks/CoreLocation.framework; sourceTree = SDKROOT; };
+		DD604ADDBC9D944D2B1C2EC4 /* MobileAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileAppModel.swift; sourceTree = "<group>"; };
+		E6581E311A0B51B7623A6331 /* NetworkPolicyView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPolicyView.swift; sourceTree = "<group>"; };
+		E997F0554161F2B2449F3925 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		89D109FEF3B67D47A57F8912 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CA6187C5DBC5F717D54BB0F9 /* RoutingCore in Frameworks */,
+				F11E7582A8C5A69BB17114C7 /* NetworkExtension.framework in Frameworks */,
+				3EFC7E51C387DD059C63C9E4 /* Network.framework in Frameworks */,
+				A9913386765270B00C65AA5A /* CoreLocation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		8A5EF1AB797676B82D4FA359 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B5C66B314CE6E4DE0347BEC9 /* RoutingCore in Frameworks */,
+				8840D52B9ED81E15A3D1A1D9 /* NetworkExtension.framework in Frameworks */,
+				328804BACD128C8400DA900E /* Network.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		11494CE08F7459C0FE0E4FD4 /* PacketTunnelExtension */ = {
+			isa = PBXGroup;
+			children = (
+				D827AF5F56DDB37ECA5FB1A4 /* Info.plist */,
+				C98532E30200C0F53B5493A0 /* PacketTunnelExtension.entitlements */,
+				E997F0554161F2B2449F3925 /* PacketTunnelProvider.swift */,
+			);
+			path = PacketTunnelExtension;
+			sourceTree = "<group>";
+		};
+		322D72E3EEA0464C43C19FCB /* RouteWeaveriOS */ = {
+			isa = PBXGroup;
+			children = (
+				9C57C2818F83C160B13C2589 /* Views */,
+				B294CCBCF51595AABF6904E4 /* Assets.xcassets */,
+				90ABC0B9E1C4A047D6476480 /* Info.plist */,
+				DD604ADDBC9D944D2B1C2EC4 /* MobileAppModel.swift */,
+				B10D551B8974E9C0A50DC1B7 /* RouteWeaveriOS.entitlements */,
+				4B33990CD1E6FF1BAD5D1788 /* RouteWeaveriOSApp.swift */,
+			);
+			path = RouteWeaveriOS;
+			sourceTree = "<group>";
+		};
+		5D38FB7C5467B0496B1CC7ED /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				DD3027759FCEDE4EB99A17C9 /* CoreLocation.framework */,
+				CD350E1054BFD4CBA1107284 /* Network.framework */,
+				BC1A428B2D6A74A7D2DCEE54 /* NetworkExtension.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		6C1FC5121C6ABF0844EF01C8 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				B0DABFFED5866A11B51E7DEB /* RouteWeaver */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		8B98CFAC07180BE106238207 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4C92C518699E21842438D7C8 /* PacketTunnelExtension.appex */,
+				44549E3CB49650EB89C372E8 /* RouteWeaveriOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		9C57C2818F83C160B13C2589 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				03CCB67930C52C4F6B0A9E10 /* HomeView.swift */,
+				783EAEBB125A471F583D8DA4 /* InterfaceRelayView.swift */,
+				9FC4C6C582385F6E65BAE0CA /* MonitorAndStatsView.swift */,
+				E6581E311A0B51B7623A6331 /* NetworkPolicyView.swift */,
+				82ECDBE31F0C5C0294AF8357 /* ProxyAndRulesView.swift */,
+				363D00E0D9F11DDAC98993DA /* RemotePCView.swift */,
+				912A3F2776D9DD701A30EE59 /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		A2E7BFF53C845BF1BA6715FA = {
+			isa = PBXGroup;
+			children = (
+				6C1FC5121C6ABF0844EF01C8 /* Packages */,
+				11494CE08F7459C0FE0E4FD4 /* PacketTunnelExtension */,
+				322D72E3EEA0464C43C19FCB /* RouteWeaveriOS */,
+				EFBC96D80BE5A9A2154D8C50 /* Shared */,
+				5D38FB7C5467B0496B1CC7ED /* Frameworks */,
+				8B98CFAC07180BE106238207 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		EFBC96D80BE5A9A2154D8C50 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				39A9EDD43F868D5F4A6C35A8 /* AppGroupStore.swift */,
+				CF5EDE4C8284F88E1609BF97 /* LocalRelayBridgeServer.swift */,
+				73E8ABBF5C5F0282118C6EF9 /* LumzelRelayClient.swift */,
+				1784D8FC4CE314CB50787A58 /* MihomoEngineAdapter.swift */,
+				63EE07670EEB89C4A6081D06 /* MobileRemoteClient.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		66090D8F8A95FF203CCF3319 /* RouteWeaveriOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7115FB157B5BDA7CB9CA350B /* Build configuration list for PBXNativeTarget "RouteWeaveriOS" */;
+			buildPhases = (
+				22CF6833CD3247EA14FBA904 /* Sources */,
+				D24865D319EBD7555AD9BB1E /* Resources */,
+				89D109FEF3B67D47A57F8912 /* Frameworks */,
+				958141986F0096D22EF0EF38 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				837E7A3BC77D09511C83D1DB /* PBXTargetDependency */,
+			);
+			name = RouteWeaveriOS;
+			packageProductDependencies = (
+				4B82D260A80F662EC9DA8A90 /* RoutingCore */,
+			);
+			productName = RouteWeaveriOS;
+			productReference = 44549E3CB49650EB89C372E8 /* RouteWeaveriOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		E531021177739FECB01EF111 /* PacketTunnelExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B39E500A1FA3D2ED8EEF4F60 /* Build configuration list for PBXNativeTarget "PacketTunnelExtension" */;
+			buildPhases = (
+				35E5CAD6F5BBB52430F86F73 /* Sources */,
+				8A5EF1AB797676B82D4FA359 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = PacketTunnelExtension;
+			packageProductDependencies = (
+				D5F21D43E0827B5CB0C21536 /* RoutingCore */,
+			);
+			productName = PacketTunnelExtension;
+			productReference = 4C92C518699E21842438D7C8 /* PacketTunnelExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		9904469F581EF445E3555ECA /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					66090D8F8A95FF203CCF3319 = {
+						DevelopmentTeam = FHTJ7A4CQS;
+						ProvisioningStyle = Automatic;
+					};
+					E531021177739FECB01EF111 = {
+						DevelopmentTeam = FHTJ7A4CQS;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 335B38D0B6D89A262BEC92B3 /* Build configuration list for PBXProject "RouteWeaveriOS" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = A2E7BFF53C845BF1BA6715FA;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				9ACE7C8DCD70CEBF6A04A14B /* XCLocalSwiftPackageReference ".." */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 8B98CFAC07180BE106238207 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				66090D8F8A95FF203CCF3319 /* RouteWeaveriOS */,
+				E531021177739FECB01EF111 /* PacketTunnelExtension */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D24865D319EBD7555AD9BB1E /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				90AE9F54F8F9D581B43174B3 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		22CF6833CD3247EA14FBA904 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CC5C7C02F32F53805E4D99D4 /* AppGroupStore.swift in Sources */,
+				4BC4F71CCD7FAB2A0587F2AF /* HomeView.swift in Sources */,
+				EFC12E9612A5A63594672BE4 /* InterfaceRelayView.swift in Sources */,
+				7C23B1F67601DCE06E5CEF1A /* LocalRelayBridgeServer.swift in Sources */,
+				B2819AF7D99A02E1179A6E17 /* LumzelRelayClient.swift in Sources */,
+				8FCF110771F4A5BCA8DFF693 /* MihomoEngineAdapter.swift in Sources */,
+				EBEF24E0EDE20927C2E7112D /* MobileAppModel.swift in Sources */,
+				7BD70264528DF4733183826D /* MobileRemoteClient.swift in Sources */,
+				50459A1D17C37215C731CD7C /* MonitorAndStatsView.swift in Sources */,
+				780483946B3A6F4A8D85AB09 /* NetworkPolicyView.swift in Sources */,
+				57698C957E1F20D02F1C7B02 /* ProxyAndRulesView.swift in Sources */,
+				8892869656D61D4237E085ED /* RemotePCView.swift in Sources */,
+				E564CF613A087CCCA9E40043 /* RouteWeaveriOSApp.swift in Sources */,
+				508A8AF72BF076217F9878FC /* SettingsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		35E5CAD6F5BBB52430F86F73 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				704DB0EEFB7FAB35BCCE9385 /* AppGroupStore.swift in Sources */,
+				43696E6AEA01BAAC167E11DE /* LocalRelayBridgeServer.swift in Sources */,
+				73C6BECB36AF4A55C39330C5 /* LumzelRelayClient.swift in Sources */,
+				C81ED70F4ED7CE60EBAEDC73 /* MihomoEngineAdapter.swift in Sources */,
+				9408C905928C1B1DEAE462D3 /* MobileRemoteClient.swift in Sources */,
+				0BE95C29819C3103FA979256 /* PacketTunnelProvider.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		837E7A3BC77D09511C83D1DB /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E531021177739FECB01EF111 /* PacketTunnelExtension */;
+			targetProxy = B1F338EF6D26665C7AE5675B /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		2283AA35F7FFE1BB33FD4994 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PacketTunnelExtension/PacketTunnelExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = PacketTunnelExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.bytevela.routeweaver.packet-tunnel";
+				PRODUCT_NAME = PacketTunnelExtension;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		6E6CA250CD15F256F113767D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = RouteWeaveriOS/RouteWeaveriOS.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = RouteWeaveriOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytevela.routeweaver;
+				PRODUCT_NAME = RouteWeaver;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		8568DA4C21946454A966BEBC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = FHTJ7A4CQS;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		B8231FD8E1BCD0072EB223B3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = FHTJ7A4CQS;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.9;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		E1A8F778CA00F7BCE7E9D926 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PacketTunnelExtension/PacketTunnelExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = PacketTunnelExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.bytevela.routeweaver.packet-tunnel";
+				PRODUCT_NAME = PacketTunnelExtension;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		FE61352D792D1E145890508B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = RouteWeaveriOS/RouteWeaveriOS.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = RouteWeaveriOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytevela.routeweaver;
+				PRODUCT_NAME = RouteWeaver;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		335B38D0B6D89A262BEC92B3 /* Build configuration list for PBXProject "RouteWeaveriOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B8231FD8E1BCD0072EB223B3 /* Debug */,
+				8568DA4C21946454A966BEBC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		7115FB157B5BDA7CB9CA350B /* Build configuration list for PBXNativeTarget "RouteWeaveriOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6E6CA250CD15F256F113767D /* Debug */,
+				FE61352D792D1E145890508B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		B39E500A1FA3D2ED8EEF4F60 /* Build configuration list for PBXNativeTarget "PacketTunnelExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2283AA35F7FFE1BB33FD4994 /* Debug */,
+				E1A8F778CA00F7BCE7E9D926 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		9ACE7C8DCD70CEBF6A04A14B /* XCLocalSwiftPackageReference ".." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ..;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		4B82D260A80F662EC9DA8A90 /* RoutingCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = RoutingCore;
+		};
+		D5F21D43E0827B5CB0C21536 /* RoutingCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = RoutingCore;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 9904469F581EF445E3555ECA /* Project object */;
+}
