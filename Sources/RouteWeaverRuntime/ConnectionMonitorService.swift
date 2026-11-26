@@ -8,17 +8,25 @@ final class ConnectionMonitorService: ObservableObject {
     @Published private(set) var trafficHistory = TrafficHistoryAccumulator()
     @Published private(set) var trafficRanking = TrafficRankingAccumulator()
     @Published private(set) var dnsTracker = DNSLogTracker(maxRecords: 500)
+    @Published private(set) var outboundErrorTracker = OutboundErrorTracker(maxRecords: 300)
     @Published var isPaused = false
     @Published private(set) var isStreaming = false
     @Published private(set) var isClosingConnections = false
     @Published private(set) var isFlushingDNSCache = false
     @Published private(set) var lastError: String?
+    var localIPs: Set<String> = []
+    /// Invoked when an outbound dial failure or repeated zero-byte proxy blackhole is observed for a target.
+    var onTargetAnomalyDetected: (@MainActor (String) -> Void)?
 
     var maxDNSLogs: Int { dnsTracker.maxRecords }
     var dnsLogs: [DNSLogRecord] { dnsTracker.records }
+    var outboundErrors: [OutboundErrorRecord] { outboundErrorTracker.records }
     private var internalTracker = ConnectionTracker()
     private var internalDNSTracker = DNSLogTracker(maxRecords: 500)
+    private var internalOutboundErrorTracker = OutboundErrorTracker(maxRecords: 300)
     private var pendingDNSLogs: [DNSLogRecord] = []
+    private var pendingOutboundErrors: [OutboundErrorRecord] = []
+    private var zeroResponseCountByTarget: [String: [Date]] = [:]
     private var activeController: (any MihomoControlClient)?
     private var streamTask: Task<Void, Never>?
     private var dnsLogTask: Task<Void, Never>?
@@ -43,8 +51,18 @@ final class ConnectionMonitorService: ObservableObject {
             flushHistory(sync: true)
         }
         historyDirectory = normalized
-        trafficHistory = Self.loadHistory(in: normalized)
-        trafficRanking = Self.loadRanking(in: normalized)
+        trafficHistory = Self.loadArchive(
+            TrafficHistoryAccumulator.self,
+            fileName: Self.historyFileName,
+            in: normalized,
+            defaultValue: TrafficHistoryAccumulator()
+        )
+        trafficRanking = Self.loadArchive(
+            TrafficRankingAccumulator.self,
+            fileName: Self.rankingFileName,
+            in: normalized,
+            defaultValue: TrafficRankingAccumulator()
+        )
         hasUnsavedHistory = false
     }
 
@@ -76,13 +94,13 @@ final class ConnectionMonitorService: ObservableObject {
         lastHistorySaveAt = Date()
         if sync {
             historyPersistenceQueue.sync {
-                Self.saveHistory(snapshot, in: directory)
-                Self.saveRanking(rankingSnapshot, in: directory)
+                Self.saveArchive(snapshot, fileName: Self.historyFileName, in: directory)
+                Self.saveArchive(rankingSnapshot, fileName: Self.rankingFileName, in: directory)
             }
         } else {
             historyPersistenceQueue.async {
-                Self.saveHistory(snapshot, in: directory)
-                Self.saveRanking(rankingSnapshot, in: directory)
+                Self.saveArchive(snapshot, fileName: Self.historyFileName, in: directory)
+                Self.saveArchive(rankingSnapshot, fileName: Self.rankingFileName, in: directory)
             }
         }
     }
@@ -101,8 +119,12 @@ final class ConnectionMonitorService: ObservableObject {
         internalTracker.reset()
         tracker.reset()
         internalDNSTracker.clear()
+        internalOutboundErrorTracker.clear()
         pendingDNSLogs.removeAll()
+        pendingOutboundErrors.removeAll()
+        zeroResponseCountByTarget.removeAll()
         dnsTracker.clear()
+        outboundErrorTracker.clear()
         isPaused = false
         lastError = nil
 
@@ -130,6 +152,7 @@ final class ConnectionMonitorService: ObservableObject {
             flushPendingDNSLogs()
             tracker = internalTracker
             dnsTracker = internalDNSTracker
+            outboundErrorTracker = internalOutboundErrorTracker
         }
     }
 
@@ -142,6 +165,170 @@ final class ConnectionMonitorService: ObservableObject {
         internalDNSTracker.clear()
         pendingDNSLogs.removeAll()
         dnsTracker.clear()
+    }
+
+    func clearOutboundErrors() {
+        internalOutboundErrorTracker.clear()
+        pendingOutboundErrors.removeAll()
+        zeroResponseCountByTarget.removeAll()
+        outboundErrorTracker.clear()
+    }
+
+    func seedOutboundErrorsFromLogText(_ rawLogs: String) {
+        let parsed = OutboundErrorParser.parseLogBuffer(rawLogs)
+        guard !parsed.isEmpty else { return }
+        internalOutboundErrorTracker.replaceAll(parsed)
+        if !isPaused {
+            outboundErrorTracker = internalOutboundErrorTracker
+        }
+    }
+
+    func applyRemoteData(
+        status: RemoteStatusSnapshot?,
+        connections: [RemoteConnectionDTO],
+        dnsLogs: [RemoteDNSLogDTO],
+        trafficHistory remoteHistory: TrafficHistoryAccumulator?,
+        trafficRanking remoteRanking: TrafficRankingAccumulator?,
+        rawLogs: String = "",
+        outboundErrors: [OutboundErrorRecord]? = nil,
+        targetSessionTotals: [String: TrafficBytes]? = nil,
+        targetConnectionCounts: [String: Int]? = nil,
+        targetSpeeds: [String: TrafficBytes]? = nil,
+        ruleSessionTotals: [String: TrafficBytes]? = nil
+    ) {
+        let now = Date()
+        let mappedConnections: [MonitoredConnection] = connections.map { dto in
+            let rawChains: [String]
+            if let explicitChains = dto.chains, !explicitChains.isEmpty {
+                rawChains = explicitChains
+            } else {
+                let chainParts = dto.chain
+                    .components(separatedBy: " → ")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                rawChains = Array(chainParts.reversed())
+            }
+            let resolvedClosedAt: Date?
+            if dto.isActive {
+                resolvedClosedAt = nil
+            } else if let explicitClosedAt = dto.closedAt {
+                resolvedClosedAt = explicitClosedAt
+            } else if let previous = internalTracker.recordsByID[dto.id] {
+                resolvedClosedAt = previous.isActive ? now : previous.closedAt
+            } else {
+                resolvedClosedAt = dto.startDate ?? .distantPast
+            }
+            let meta = MihomoConnectionMetadata(
+                network: dto.network,
+                type: dto.type ?? "",
+                sourceIP: dto.sourceIP,
+                destinationIP: dto.destinationIP,
+                sourcePort: dto.sourcePort ?? "",
+                destinationPort: dto.destinationPort ?? "",
+                host: dto.host,
+                dnsMode: "",
+                process: dto.process ?? "",
+                processPath: "",
+                remoteDestination: dto.destinationIP
+            )
+            return MonitoredConnection(
+                id: dto.id,
+                metadata: meta,
+                upload: dto.upload,
+                download: dto.download,
+                uploadSpeed: dto.uploadSpeed,
+                downloadSpeed: dto.downloadSpeed,
+                startRaw: "",
+                startDate: dto.startDate,
+                firstSeenAt: dto.startDate ?? now,
+                lastSeenAt: now,
+                closedAt: resolvedClosedAt,
+                chains: rawChains.isEmpty ? ["DIRECT"] : rawChains,
+                rule: dto.rule,
+                rulePayload: dto.matchedRuleSet ?? "",
+                isActive: dto.isActive
+            )
+        }
+
+        internalTracker.applyRemoteSnapshot(
+            records: mappedConnections,
+            uploadSpeed: status?.uploadSpeed ?? 0,
+            downloadSpeed: status?.downloadSpeed ?? 0,
+            uploadTotal: status?.uploadTotal ?? 0,
+            downloadTotal: status?.downloadTotal ?? 0,
+            memoryUsage: 0,
+            targetSessionTotals: targetSessionTotals,
+            targetConnectionCounts: targetConnectionCounts,
+            targetSpeeds: targetSpeeds,
+            ruleSessionTotals: ruleSessionTotals,
+            at: now
+        )
+
+        let mappedDNS: [DNSLogRecord] = dnsLogs.map { dto in
+            let statusEnum: DNSQueryStatus = dto.status == DNSQueryStatus.failed.rawValue ? .failed : .resolved
+            let answers: [String]
+            let errorMessage: String?
+            if statusEnum == .failed {
+                answers = []
+                errorMessage = dto.result
+            } else {
+                answers = dto.result
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                errorMessage = nil
+            }
+            let resolvedUpstream = dto.upstream?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let upstream = (resolvedUpstream?.isEmpty == false)
+                ? resolvedUpstream!
+                : (statusEnum == .failed ? "DNS Server" : "remote")
+            return DNSLogRecord(
+                id: UUID(uuidString: dto.id) ?? UUID(),
+                timestamp: dto.timestamp,
+                domain: dto.domain,
+                recordType: dto.queryType,
+                answers: answers,
+                upstream: upstream,
+                cacheExpireAt: nil,
+                status: statusEnum,
+                errorMessage: errorMessage,
+                rawPayload: dto.rawPayload ?? "\(dto.domain) (\(dto.queryType)) -> \(dto.result)"
+            )
+        }
+        internalDNSTracker.replaceAll(mappedDNS)
+        if let outboundErrors {
+            internalOutboundErrorTracker.replaceAll(outboundErrors)
+        } else {
+            internalOutboundErrorTracker.replaceAll(OutboundErrorParser.parseLogBuffer(rawLogs))
+        }
+
+        if let remoteHistory {
+            trafficHistory = remoteHistory
+        }
+        if let remoteRanking {
+            trafficRanking = remoteRanking
+        }
+        isStreaming = status?.isRunning ?? false
+        if !isPaused {
+            tracker = internalTracker
+            dnsTracker = internalDNSTracker
+            outboundErrorTracker = internalOutboundErrorTracker
+        }
+        lastError = nil
+    }
+
+    func resetRemoteData() {
+        internalTracker.reset()
+        tracker.reset()
+        internalDNSTracker.clear()
+        internalOutboundErrorTracker.clear()
+        dnsTracker.clear()
+        outboundErrorTracker.clear()
+        zeroResponseCountByTarget.removeAll()
+        trafficHistory = TrafficHistoryAccumulator()
+        trafficRanking = TrafficRankingAccumulator()
+        isStreaming = false
+        lastError = nil
     }
 
     func filteredDNSLogs(
@@ -197,7 +384,33 @@ final class ConnectionMonitorService: ObservableObject {
 
     private func ingest(_ snapshot: MihomoConnectionsSnapshot) {
         let now = Date()
-        internalTracker.ingest(snapshot, at: now)
+        let activeIDsInSnapshot = Set(snapshot.connections.map(\.id))
+        var newlyBlackholedTargets = Set<String>()
+        var targetsWithFreshDownload = Set<String>()
+
+        for conn in snapshot.connections where !conn.metadata.type.localizedCaseInsensitiveContains("Inner") {
+            let prevDown = internalTracker.recordsByID[conn.id]?.download ?? 0
+            if conn.download > prevDown {
+                targetsWithFreshDownload.insert(conn.chains.last ?? "DIRECT")
+            }
+        }
+        for (id, existing) in internalTracker.recordsByID where existing.isActive && !activeIDsInSnapshot.contains(id) {
+            if !existing.isInner && !existing.isDirect && !existing.isRejected,
+               existing.upload > 0 && existing.download == 0 {
+                let target = existing.primaryTarget
+                var timestamps = (zeroResponseCountByTarget[target] ?? []).filter { now.timeIntervalSince($0) <= 60 }
+                timestamps.append(now)
+                zeroResponseCountByTarget[target] = timestamps
+                if timestamps.count >= 2 {
+                    newlyBlackholedTargets.insert(target)
+                }
+            }
+        }
+        for healthyTarget in targetsWithFreshDownload {
+            zeroResponseCountByTarget.removeValue(forKey: healthyTarget)
+        }
+
+        internalTracker.ingest(snapshot, localIPs: localIPs, at: now)
         if internalTracker.lastUploadDelta > 0
             || internalTracker.lastDownloadDelta > 0
             || !internalTracker.lastTargetDeltas.isEmpty {
@@ -220,74 +433,64 @@ final class ConnectionMonitorService: ObservableObject {
             tracker = internalTracker
         }
         lastError = nil
+
+        for target in newlyBlackholedTargets {
+            onTargetAnomalyDetected?(target)
+        }
     }
+
+    private nonisolated static let historyFileName = "traffic-history.json"
+    private nonisolated static let rankingFileName = "traffic-ranking.json"
 
     private nonisolated static var defaultDirectory: URL {
         ProfileStore().defaultDirectory
     }
 
-    private nonisolated static func historyURL(in directory: URL) -> URL {
-        directory.standardizedFileURL.appendingPathComponent("traffic-history.json")
-    }
-
-    private nonisolated static func loadHistory(in directory: URL) -> TrafficHistoryAccumulator {
-        let primary = historyURL(in: directory)
+    nonisolated static func loadArchive<T: Decodable>(
+        _ type: T.Type,
+        fileName: String,
+        in directory: URL,
+        defaultValue: @autoclosure () -> T
+    ) -> T {
+        let primary = directory.standardizedFileURL.appendingPathComponent(fileName)
         if let data = try? Data(contentsOf: primary),
-           let decoded = try? JSONDecoder().decode(TrafficHistoryAccumulator.self, from: data) {
+           let decoded = try? JSONDecoder().decode(T.self, from: data) {
             return decoded
         }
         if directory.standardizedFileURL != defaultDirectory.standardizedFileURL {
-            let fallback = historyURL(in: defaultDirectory)
+            let fallback = defaultDirectory.standardizedFileURL.appendingPathComponent(fileName)
             if let data = try? Data(contentsOf: fallback),
-               let decoded = try? JSONDecoder().decode(TrafficHistoryAccumulator.self, from: data) {
+               let decoded = try? JSONDecoder().decode(T.self, from: data) {
                 return decoded
             }
         }
-        return TrafficHistoryAccumulator()
+        return defaultValue()
     }
 
-    private nonisolated static func saveHistory(_ history: TrafficHistoryAccumulator, in directory: URL) {
-        guard let data = try? JSONEncoder().encode(history) else { return }
-        let targetURL = historyURL(in: directory)
+    nonisolated static func saveArchive<T: Encodable>(_ value: T, fileName: String, in directory: URL) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        let targetURL = directory.standardizedFileURL.appendingPathComponent(fileName)
         let dir = targetURL.deletingLastPathComponent()
         let isDefault = directory.standardizedFileURL == defaultDirectory.standardizedFileURL
         let attrs: [FileAttributeKey: Any]? = isDefault ? [.posixPermissions: 0o700] : nil
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: attrs)
-        try? ProfileStore.writePrivateFile(data, to: targetURL, tempName: "traffic-history.json")
-    }
-
-    private nonisolated static func rankingURL(in directory: URL) -> URL {
-        directory.standardizedFileURL.appendingPathComponent("traffic-ranking.json")
-    }
-
-    private nonisolated static func loadRanking(in directory: URL) -> TrafficRankingAccumulator {
-        let primary = rankingURL(in: directory)
-        if let data = try? Data(contentsOf: primary),
-           let decoded = try? JSONDecoder().decode(TrafficRankingAccumulator.self, from: data) {
-            return decoded
-        }
-        if directory.standardizedFileURL != defaultDirectory.standardizedFileURL {
-            let fallback = rankingURL(in: defaultDirectory)
-            if let data = try? Data(contentsOf: fallback),
-               let decoded = try? JSONDecoder().decode(TrafficRankingAccumulator.self, from: data) {
-                return decoded
-            }
-        }
-        return TrafficRankingAccumulator()
-    }
-
-    private nonisolated static func saveRanking(_ ranking: TrafficRankingAccumulator, in directory: URL) {
-        guard let data = try? JSONEncoder().encode(ranking) else { return }
-        let targetURL = rankingURL(in: directory)
-        let dir = targetURL.deletingLastPathComponent()
-        let isDefault = directory.standardizedFileURL == defaultDirectory.standardizedFileURL
-        let attrs: [FileAttributeKey: Any]? = isDefault ? [.posixPermissions: 0o700] : nil
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: attrs)
-        try? ProfileStore.writePrivateFile(data, to: targetURL, tempName: "traffic-ranking.json")
+        try? ProfileStore.writePrivateFile(data, to: targetURL, tempName: fileName)
     }
 
     private func enqueueDNS(_ record: DNSLogRecord) {
         pendingDNSLogs.append(record)
+        scheduleLogBatchFlushIfNeeded()
+    }
+
+    private func enqueueOutboundError(_ record: OutboundErrorRecord) {
+        pendingOutboundErrors.append(record)
+        scheduleLogBatchFlushIfNeeded()
+        if record.category != .rejected {
+            onTargetAnomalyDetected?(record.primaryTarget)
+        }
+    }
+
+    private func scheduleLogBatchFlushIfNeeded() {
         guard dnsFlushTask == nil else { return }
         dnsFlushTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
@@ -299,12 +502,21 @@ final class ConnectionMonitorService: ObservableObject {
     private func flushPendingDNSLogs() {
         dnsFlushTask?.cancel()
         dnsFlushTask = nil
-        guard !pendingDNSLogs.isEmpty else { return }
-        let batch = pendingDNSLogs
-        pendingDNSLogs.removeAll(keepingCapacity: true)
-        internalDNSTracker.appendBatch(batch)
-        if !isPaused {
-            dnsTracker = internalDNSTracker
+        if !pendingDNSLogs.isEmpty {
+            let batch = pendingDNSLogs
+            pendingDNSLogs.removeAll(keepingCapacity: true)
+            internalDNSTracker.appendBatch(batch)
+            if !isPaused {
+                dnsTracker = internalDNSTracker
+            }
+        }
+        if !pendingOutboundErrors.isEmpty {
+            let errBatch = pendingOutboundErrors
+            pendingOutboundErrors.removeAll(keepingCapacity: true)
+            internalOutboundErrorTracker.appendBatch(errBatch)
+            if !isPaused {
+                outboundErrorTracker = internalOutboundErrorTracker
+            }
         }
     }
 
@@ -315,9 +527,14 @@ final class ConnectionMonitorService: ObservableObject {
 
         while !Task.isCancelled && activeController?.sessionID == controller.sessionID {
             do {
-                for try await record in controller.dnsLogRecords(level: "debug") {
+                for try await event in controller.logEvents(level: "debug") {
                     guard !Task.isCancelled && activeController?.sessionID == controller.sessionID else { break }
-                    enqueueDNS(record)
+                    switch event {
+                    case .dns(let record):
+                        enqueueDNS(record)
+                    case .outboundError(let errorRecord):
+                        enqueueOutboundError(errorRecord)
+                    }
                 }
                 guard !Task.isCancelled && activeController?.sessionID == controller.sessionID else { break }
                 if reconnectDelayNs > 0 {

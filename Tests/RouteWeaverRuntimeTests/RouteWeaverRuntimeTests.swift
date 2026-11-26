@@ -114,6 +114,8 @@ final class FakeMihomoControlClient: MihomoControlClient, @unchecked Sendable {
     private(set) var selectedHistory: [(group: String, node: String)] = []
     private(set) var testedGroups: [String] = []
     private(set) var httpConnectionsCalls = 0
+    private(set) var reloadedPayloads: [Data] = []
+    var reloadHandler: (@Sendable (String, Data) throws -> Void)?
 
     init(port: Int = 19090, secret: String = "test", trackedGroups: [String] = ["Proxy"], sessionID: UUID = UUID()) {
         self.sessionID = sessionID
@@ -147,7 +149,10 @@ final class FakeMihomoControlClient: MihomoControlClient, @unchecked Sendable {
         return delayResult
     }
 
-    func reloadConfig(payload: Data) async throws {}
+    func reloadConfig(payload: Data) async throws {
+        reloadedPayloads.append(payload)
+        try reloadHandler?(secret, payload)
+    }
     func updateAllRuleProviders() async throws -> Int { ruleProviderCount }
 
     func connections() async throws -> MihomoConnectionsSnapshot {
@@ -435,5 +440,76 @@ final class RouteWeaverRuntimeTests: XCTestCase {
 
         reloaded.clearTrafficRanking()
         XCTAssertTrue(reloaded.trafficRanking.report(dimension: .domain, window: .today).items.isEmpty)
+    }
+
+    func testEngineControllerAllowsStartupWhenBoundInterfaceIsMissing() async throws {
+        let dir = try makeTempDir()
+        let bin = try makeFakeBinary(in: dir)
+        let handle = FakeRuntimeHandle(initialPid: 6001, isLaunchdManaged: false)
+        let driver = FakeRuntimeDriver()
+        driver.interfaces = ["en0"]
+        driver.nextHandle = handle
+
+        let engine = EngineController(stateDir: dir, driver: driver)
+        engine.start(
+            config: Data("mixed-port: 7890\n".utf8),
+            binary: bin,
+            interfaces: ["en5"],
+            useTun: false,
+            useGateway: false,
+            useSystemKeepAlive: false
+        )
+
+        let reachedRunning = await waitUntil { engine.phase == .running }
+        XCTAssertTrue(reachedRunning)
+        XCTAssertNil(engine.lastError)
+        XCTAssertTrue(engine.logStore.text.contains("en5"))
+
+        engine.stop()
+        let stopped = await waitUntil { engine.phase == .idle }
+        XCTAssertTrue(stopped)
+    }
+
+    func testEngineControllerAllowsGatewayStartupOnNeedsSyncWhileBlockingNotAuthorized() async throws {
+        let dir = try makeTempDir()
+        let bin = try makeFakeBinary(in: dir)
+        let handle = FakeRuntimeHandle(initialPid: 7001, isLaunchdManaged: true)
+        let driver = FakeRuntimeDriver()
+        driver.tunStatus = .needsSync
+        driver.nextHandle = handle
+
+        let engine = EngineController(stateDir: dir, driver: driver)
+        engine.start(
+            config: Data("mixed-port: 7890\n".utf8),
+            binary: bin,
+            interfaces: ["en0"],
+            useTun: true,
+            useGateway: true,
+            useSystemKeepAlive: true
+        )
+
+        let reachedRunning = await waitUntil { engine.phase == .running }
+        XCTAssertTrue(reachedRunning)
+        XCTAssertTrue(engine.isGatewayActive)
+        XCTAssertTrue(engine.isTunActive)
+        XCTAssertNil(engine.lastError)
+        XCTAssertTrue(engine.logStore.text.contains("继续使用已授权的受信任内核启动"))
+
+        engine.stop()
+        let stopped = await waitUntil { engine.phase == .idle }
+        XCTAssertTrue(stopped)
+
+        // When strictly .notAuthorized, startup must still be blocked synchronously
+        driver.tunStatus = .notAuthorized
+        engine.start(
+            config: Data("mixed-port: 7890\n".utf8),
+            binary: bin,
+            interfaces: ["en0"],
+            useTun: true,
+            useGateway: true,
+            useSystemKeepAlive: true
+        )
+        XCTAssertEqual(engine.phase, .idle)
+        XCTAssertNotNil(engine.lastError)
     }
 }

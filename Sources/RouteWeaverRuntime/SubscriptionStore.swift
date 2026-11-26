@@ -6,11 +6,26 @@ struct SubscriptionNodeCacheEntry: Codable, Equatable {
     let nodes: [SubscriptionNode]
     let updatedAt: Date
     let usage: SubscriptionUsage?
+    let knownNodeCount: Int?
 
-    init(nodes: [SubscriptionNode], updatedAt: Date, usage: SubscriptionUsage? = nil) {
+    var effectiveNodeCount: Int {
+        nodes.isEmpty ? (knownNodeCount ?? 0) : nodes.count
+    }
+
+    var hasNodeDetails: Bool {
+        !nodes.isEmpty
+    }
+
+    init(
+        nodes: [SubscriptionNode],
+        updatedAt: Date,
+        usage: SubscriptionUsage? = nil,
+        knownNodeCount: Int? = nil
+    ) {
         self.nodes = nodes
         self.updatedAt = updatedAt
         self.usage = usage
+        self.knownNodeCount = knownNodeCount
     }
 }
 
@@ -38,8 +53,241 @@ final class SubscriptionStore: ObservableObject {
     @Published var fetchErrors: [UUID: String] = [:]
     @Published var updatingHostModuleIDs: Set<UUID> = []
 
+    private var remoteFallbackEntries: [UUID: (nodes: [SubscriptionNode], updatedAt: Date, usage: SubscriptionUsage?)] = [:]
+    private var remoteFallbackAttemptedURLs: Set<String> = []
+    private var remoteSessionToken = UUID()
+
     func loadCache(in directory: URL) {
         cache = Self.loadCacheFromDisk(in: directory)
+    }
+
+    /// Hydrates any subscription missing node details in `cache` from validated on-disk payloads
+    /// (`subscription-payloads/` or Mihomo `providers-cache/`), ensuring both local UI and
+    /// `RemoteServerService` always serve complete `SubscriptionNode` lists.
+    func hydrateMissingCacheEntries(
+        for profile: RoutingProfile,
+        in directory: URL,
+        mihomoWorkDirectories: [URL] = []
+    ) {
+        guard !profile.subscriptions.isEmpty else { return }
+        let missingSubs = profile.subscriptions.filter { cache[$0.id]?.hasNodeDetails != true }
+        guard !missingSubs.isEmpty else { return }
+
+        var providerRelPathsByURL: [String: [String]] = [:]
+        if !mihomoWorkDirectories.isEmpty,
+           let rendered = try? MihomoConfig.renderDetailed(profile) {
+            for item in rendered.preloadResources where item.kind == .proxyProvider {
+                let norm = Self.normalizedURLString(item.url)
+                let rel = ResourcePreloader.cleanRelativePath(item.relativePath)
+                providerRelPathsByURL[norm, default: []].append(rel)
+            }
+        }
+
+        var didMutate = false
+        let fm = FileManager.default
+        for sub in missingSubs {
+            let normURL = Self.normalizedURLString(sub.url)
+            var resolvedNodes: [SubscriptionNode] = []
+            var resolvedDate: Date?
+
+            if let payloadData = Self.cachedPayloadData(for: normURL, in: directory) {
+                resolvedNodes = SubscriptionParser.parse(payloadData)
+                resolvedDate = Self.cachedPayloadDate(for: normURL, in: directory)
+            }
+
+            if resolvedNodes.isEmpty, let relPaths = providerRelPathsByURL[normURL] {
+                outer: for workDir in mihomoWorkDirectories {
+                    for rel in relPaths {
+                        let candidateURL = workDir.appendingPathComponent(rel)
+                        guard let data = try? Data(contentsOf: candidateURL), !data.isEmpty else { continue }
+                        let parsed = SubscriptionParser.parse(data)
+                        if !parsed.isEmpty {
+                            resolvedNodes = parsed
+                            resolvedDate = (try? fm.attributesOfItem(atPath: candidateURL.path)[.modificationDate]) as? Date
+                            break outer
+                        }
+                    }
+                }
+            }
+
+            if !resolvedNodes.isEmpty {
+                let existing = cache[sub.id]
+                cache[sub.id] = SubscriptionNodeCacheEntry(
+                    nodes: resolvedNodes,
+                    updatedAt: existing?.updatedAt ?? resolvedDate ?? Date(),
+                    usage: existing?.usage
+                )
+                didMutate = true
+            }
+        }
+
+        if didMutate {
+            Self.saveCacheToDisk(cache, in: directory)
+        }
+    }
+
+    func applyRemoteUsages(
+        _ usages: [RemoteSubscriptionUsageDTO],
+        subscriptions: [ProxySubscription] = [],
+        fallbackCacheDirectory: URL? = nil,
+        fallbackProxyEndpoint: (host: String, port: Int)? = nil,
+        enableNetworkFallbackFetch: Bool = false
+    ) {
+        let subByID = Dictionary(uniqueKeysWithValues: subscriptions.map { ($0.id, $0) })
+        var newCache: [UUID: SubscriptionNodeCacheEntry] = [:]
+        var newErrors: [UUID: String] = [:]
+
+        for item in usages {
+            guard let id = UUID(uuidString: item.subscriptionId) else { continue }
+            if let err = item.fetchError, !err.isEmpty {
+                newErrors[id] = err
+            }
+            if let remoteNodes = item.nodes, !remoteNodes.isEmpty {
+                remoteFallbackEntries.removeValue(forKey: id)
+                newCache[id] = SubscriptionNodeCacheEntry(
+                    nodes: remoteNodes,
+                    updatedAt: item.updatedAt ?? Date(),
+                    usage: item.usage
+                )
+                continue
+            }
+
+            if let fallback = remoteFallbackEntries[id], !fallback.nodes.isEmpty {
+                newCache[id] = SubscriptionNodeCacheEntry(
+                    nodes: fallback.nodes,
+                    updatedAt: item.updatedAt ?? fallback.updatedAt,
+                    usage: item.usage ?? fallback.usage
+                )
+                continue
+            }
+
+            if let sub = subByID[id],
+               let fallbackDir = fallbackCacheDirectory,
+               let diskData = Self.cachedPayloadData(for: sub.url, in: fallbackDir) {
+                let parsed = SubscriptionParser.parse(diskData)
+                if !parsed.isEmpty {
+                    let diskDate = Self.cachedPayloadDate(for: sub.url, in: fallbackDir) ?? Date()
+                    remoteFallbackEntries[id] = (parsed, diskDate, nil)
+                    newCache[id] = SubscriptionNodeCacheEntry(
+                        nodes: parsed,
+                        updatedAt: item.updatedAt ?? diskDate,
+                        usage: item.usage
+                    )
+                    continue
+                }
+            }
+
+            if item.nodeCount > 0 || item.usage != nil || item.updatedAt != nil {
+                newCache[id] = SubscriptionNodeCacheEntry(
+                    nodes: [],
+                    updatedAt: item.updatedAt ?? Date(),
+                    usage: item.usage,
+                    knownNodeCount: item.nodeCount > 0 ? item.nodeCount : nil
+                )
+            }
+
+            if enableNetworkFallbackFetch,
+               let sub = subByID[id] {
+                let normURL = Self.normalizedURLString(sub.url)
+                if normURL.lowercased().hasPrefix("https://"),
+                   !remoteFallbackAttemptedURLs.contains(normURL),
+                   !fetchingIDs.contains(id) {
+                    remoteFallbackAttemptedURLs.insert(normURL)
+                    triggerRemoteFallbackFetch(
+                        for: sub,
+                        fallbackCacheDirectory: fallbackCacheDirectory,
+                        fallbackProxyEndpoint: fallbackProxyEndpoint
+                    )
+                }
+            }
+        }
+
+        // Also populate any subscriptions in `subscriptions` omitted from `usages` if we already fetched fallback nodes
+        for sub in subscriptions where newCache[sub.id] == nil {
+            if let fallback = remoteFallbackEntries[sub.id], !fallback.nodes.isEmpty {
+                newCache[sub.id] = SubscriptionNodeCacheEntry(
+                    nodes: fallback.nodes,
+                    updatedAt: fallback.updatedAt,
+                    usage: fallback.usage
+                )
+            }
+        }
+
+        if cache != newCache {
+            cache = newCache
+        }
+        if fetchErrors != newErrors {
+            fetchErrors = newErrors
+        }
+    }
+
+    func invalidateRemoteFallback(for id: UUID, url: String) {
+        remoteFallbackEntries.removeValue(forKey: id)
+        remoteFallbackAttemptedURLs.remove(Self.normalizedURLString(url))
+    }
+
+    func invalidateAllRemoteFallbacks() {
+        remoteFallbackEntries.removeAll()
+        remoteFallbackAttemptedURLs.removeAll()
+    }
+
+    func triggerRemoteFallbackFetch(
+        for sub: ProxySubscription,
+        fallbackCacheDirectory: URL?,
+        fallbackProxyEndpoint: (host: String, port: Int)?
+    ) {
+        guard !fetchingIDs.contains(sub.id) else { return }
+        let trimmed = Self.normalizedURLString(sub.url)
+        guard let url = URL(string: trimmed), url.scheme?.lowercased() == "https", url.host != nil else { return }
+
+        let token = remoteSessionToken
+        fetchingIDs.insert(sub.id)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.remoteSessionToken == token {
+                    self.fetchingIDs.remove(sub.id)
+                }
+            }
+            do {
+                let downloaded: (data: Data, usage: SubscriptionUsage?)
+                do {
+                    downloaded = try await Self.download(url: url, proxyHost: nil, proxyPort: nil)
+                } catch {
+                    if let ep = fallbackProxyEndpoint {
+                        downloaded = try await Self.download(url: url, proxyHost: ep.host, proxyPort: ep.port)
+                    } else {
+                        throw error
+                    }
+                }
+                guard self.remoteSessionToken == token else { return }
+                let nodes = SubscriptionParser.parse(downloaded.data)
+                guard !nodes.isEmpty else { return }
+                if let fallbackDir = fallbackCacheDirectory {
+                    _ = try? Self.saveValidatedPayload(downloaded.data, for: trimmed, in: fallbackDir)
+                }
+                let now = Date()
+                self.remoteFallbackEntries[sub.id] = (nodes, now, downloaded.usage)
+                let existing = self.cache[sub.id]
+                self.cache[sub.id] = SubscriptionNodeCacheEntry(
+                    nodes: nodes,
+                    updatedAt: existing?.updatedAt ?? now,
+                    usage: existing?.usage ?? downloaded.usage
+                )
+            } catch {
+                // Keep remote metadata/error state as-is on silent fallback failure.
+            }
+        }
+    }
+
+    func resetRemoteCache() {
+        remoteSessionToken = UUID()
+        remoteFallbackEntries = [:]
+        remoteFallbackAttemptedURLs = []
+        cache = [:]
+        fetchErrors = [:]
+        fetchingIDs = []
+        updatingHostModuleIDs = []
     }
 
     func saveCache(in directory: URL) {
@@ -74,7 +322,9 @@ final class SubscriptionStore: ObservableObject {
     }
 
     func matchedNodes(for group: NodeGroup) -> [SubscriptionNode]? {
-        guard let subID = group.subscriptionID, let entry = cache[subID] else {
+        guard let subID = group.subscriptionID,
+              let entry = cache[subID],
+              entry.hasNodeDetails else {
             return nil
         }
         return SubscriptionParser.matchingNodes(
@@ -304,10 +554,10 @@ final class SubscriptionStore: ObservableObject {
 
         let downloaded: (data: Data, usage: SubscriptionUsage?)
         do {
-            downloaded = try await download(url: url, proxyPort: nil)
+            downloaded = try await download(url: url, proxyHost: nil, proxyPort: nil)
         } catch {
             if let proxyPort = fallbackProxyPort {
-                downloaded = try await download(url: url, proxyPort: proxyPort)
+                downloaded = try await download(url: url, proxyHost: "127.0.0.1", proxyPort: proxyPort)
             } else {
                 throw error
             }
@@ -317,17 +567,21 @@ final class SubscriptionStore: ObservableObject {
         return (downloaded.data, nodes, downloaded.usage)
     }
 
-    private nonisolated static func download(url: URL, proxyPort: Int?) async throws -> (data: Data, usage: SubscriptionUsage?) {
+    private nonisolated static func download(
+        url: URL,
+        proxyHost: String?,
+        proxyPort: Int?
+    ) async throws -> (data: Data, usage: SubscriptionUsage?) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 30
-        if let proxyPort {
+        if let proxyHost, !proxyHost.isEmpty, let proxyPort {
             config.connectionProxyDictionary = [
                 kCFNetworkProxiesHTTPEnable as String: true,
-                kCFNetworkProxiesHTTPProxy as String: "127.0.0.1",
+                kCFNetworkProxiesHTTPProxy as String: proxyHost,
                 kCFNetworkProxiesHTTPPort as String: proxyPort,
                 kCFNetworkProxiesHTTPSEnable as String: true,
-                kCFNetworkProxiesHTTPSProxy as String: "127.0.0.1",
+                kCFNetworkProxiesHTTPSProxy as String: proxyHost,
                 kCFNetworkProxiesHTTPSPort as String: proxyPort,
             ]
         } else {

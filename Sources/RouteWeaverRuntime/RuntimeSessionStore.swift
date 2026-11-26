@@ -178,32 +178,17 @@ struct RuntimeSessionStore: Sendable {
         }
     }
 
-    static func stopTunPidAsync(_ pid: pid_t) async -> Bool {
+    static func stopTunPidAsync(_ pid: pid_t, client: PrivilegedHelperClient = .live) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let ok = stopTunPidSync(pid)
+                let ok = stopTunPidSync(pid, client: client)
                 continuation.resume(returning: ok)
             }
         }
     }
 
-    static func stopTunPidSync(_ pid: pid_t) -> Bool {
+    static func stopTunPidSync(_ pid: pid_t, client: PrivilegedHelperClient = .live) -> Bool {
         guard pid > 1 else { return true }
-        guard FileManager.default.isExecutableFile(atPath: TunHelperManager.installedHelperURL.path) else {
-            return false
-        }
-        let proc = Process()
-        proc.executableURL = TunHelperManager.installedHelperURL
-        proc.arguments = TunHelperCommand.stopPid(pid).arguments
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            return proc.terminationStatus == 0
-        } catch {
-            return false
-        }
+        return (try? client.execute(.stopPid(pid))) != nil
     }
 }

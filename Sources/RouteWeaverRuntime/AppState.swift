@@ -1,12 +1,12 @@
 import AppKit
 import Combine
 import Foundation
-import Network
 import RoutingCore
 import UniformTypeIdentifiers
 
 enum SidebarSection: String, CaseIterable, Identifiable {
     case overview
+    case topology
     case monitor
     case trafficStats
     case ruleGroups
@@ -20,6 +20,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .overview: return "总览"
+        case .topology: return "网络拓扑"
         case .monitor: return "请求监控"
         case .trafficStats: return "流量统计"
         case .ruleGroups: return "规则组"
@@ -33,6 +34,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .overview: return "gauge.with.dots.needle.33percent"
+        case .topology: return "point.3.connected.trianglepath.dotted"
         case .monitor: return "waveform.path.ecg"
         case .trafficStats: return "chart.bar.xaxis"
         case .ruleGroups: return "list.bullet.rectangle.portrait"
@@ -41,6 +43,23 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         case .subscriptions: return "point.3.filled.connected.trianglepath.dotted"
         case .settings: return "gearshape.2"
         }
+    }
+}
+
+enum ManagedDevice: Equatable, Hashable, Identifiable {
+    case local
+    case remote(String)
+
+    var id: String {
+        switch self {
+        case .local: return "local"
+        case .remote(let hostId): return "remote:\(hostId)"
+        }
+    }
+
+    var remoteHostId: String? {
+        if case .remote(let hostId) = self { return hostId }
+        return nil
     }
 }
 
@@ -53,326 +72,559 @@ struct ReadinessItem: Identifiable {
 }
 
 @MainActor
-final class AppState: ObservableObject {
+final class AppState: ObservableObject, DeviceSessionDelegate {
     @Published var selectedSection: SidebarSection? = .overview
+    @Published var selectedTopologyTargetKey: String? = nil
+    @Published private(set) var selectedDevice: ManagedDevice = .local
+    @Published var showingRemoteDeviceSheet: Bool = false
+
     @Published var profile: RoutingProfile = .starter() {
         didSet {
             ruleMatchDisplayIndex = RuleMatchDisplayIndex(profile: profile)
-            recomputeConfigValidation()
-            scheduleAutoSave()
-            if engine.isRunning, let baseline = runningProfileSnapshot {
-                hasPendingHotReload = (profile != baseline)
-            }
+            if isSyncingDeviceContext { return }
+            activeSession.handleProfileEdited(profile)
         }
     }
     private(set) var ruleMatchDisplayIndex: RuleMatchDisplayIndex = RuleMatchDisplayIndex(profile: .starter())
 
-    @Published var controllerPort: Int = 19090 {
-        didSet {
-            recomputeConfigValidation()
-            saveSettings()
-        }
-    }
-    @Published var customProfileDirectory: URL? {
-        didSet { saveSettings() }
-    }
-    @Published var autoStartCoreOnLaunch: Bool = false {
-        didSet { saveSettings() }
-    }
-    @Published var systemKeepAliveEnabled: Bool = true {
-        didSet { saveSettings() }
-    }
-    @Published private(set) var launchAtLoginStatus: LaunchAtLoginStatus = .disabled
-    @Published var interfaces: [NetworkInterfaceInfo] = []
-    @Published private(set) var hasPendingHotReload = false
-    @Published private(set) var isHotReloading = false
-    @Published var updatingGeoResources = false
-    @Published var geoUpdateMessage: String?
-    @Published private(set) var tunPermissionStatus: TunPermissionStatus = .notAuthorized
-    @Published private(set) var isAuthorizingTun = false
-    @Published private(set) var killSwitchActive = false
-    @Published var killSwitchAllowLAN: Bool = true {
-        didSet { saveSettings() }
-    }
-    @Published var killSwitchPersistOnBoot: Bool = false {
-        didSet { saveSettings() }
-    }
-    @Published private(set) var isUpdatingKillSwitch = false
-    @Published private(set) var isIPForwardingEnabled = NetworkEnvironment.isIPForwardingEnabled()
-    @Published private(set) var configValidationError: String?
     @Published var alertText: String?
     @Published var feedback: String = ""
 
-    let engine: EngineController
-    let liveProxyStore: LiveProxyStore
-    let coreBinaryStore = CoreBinaryStore()
-    let subscriptionStore = SubscriptionStore()
-    let connectionMonitor: ConnectionMonitorService
+    let localSession: LocalDeviceSession
+    let remoteSession: RemoteDeviceSession
+    let remoteServer = RemoteServerService()
+    let remoteClient: RemoteClientService
+    let remoteBridge: RemoteNetworkBridge
 
+    private let routingSnapshotProvider: () -> SystemNetworkRoutingSnapshot
     private var cancellables = Set<AnyCancellable>()
     private var feedbackTask: Task<Void, Never>?
-    private var autoSaveTask: Task<Void, Never>?
-    private let pathMonitor = NWPathMonitor()
-    private let pathMonitorQueue = DispatchQueue(label: "local.routeweaver.path-monitor", qos: .utility)
-    private var isRestoring = false
-    private var runningProfileSnapshot: RoutingProfile?
+    private var isSyncingDeviceContext = false
+    private var hasUserManuallySelectedDevice = false
 
-    var binary: URL? { coreBinaryStore.binary }
+    // MARK: - Active Session Facade
 
-    private var profileStore: ProfileStore {
-        ProfileStore(customDirectory: customProfileDirectory)
+    var activeSession: any DeviceSession {
+        selectedDevice == .local ? localSession : remoteSession
     }
 
-    var activeProfileDirectory: URL { profileStore.activeDirectory }
-    var savedProfileURL: URL { profileStore.activeProfileURL }
-    var isUsingCustomProfileDirectory: Bool { profileStore.isUsingCustomDirectory }
-
-    private enum DefaultsKey {
-        static let controllerPort = "RouteWeaver.controllerPort"
-        static let profileDirectoryPath = "RouteWeaver.profileDirectoryPath"
-        static let autoStartCoreOnLaunch = "RouteWeaver.autoStartCoreOnLaunch"
-        static let systemKeepAliveEnabled = "RouteWeaver.systemKeepAliveEnabled"
-        static let killSwitchAllowLAN = "RouteWeaver.killSwitchAllowLAN"
-        static let killSwitchPersistOnBoot = "RouteWeaver.killSwitchPersistOnBoot"
+    var isViewingRemote: Bool {
+        activeSession.isRemote
     }
 
-    var editingLocked: Bool { engine.isRunning || engine.isBusy }
-    var hotReloadEditingLocked: Bool { engine.isBusy || isHotReloading }
-    var activeMixedPort: Int { runningProfileSnapshot?.mixedPort ?? profile.mixedPort }
-
-    var localProxyAddress: String { "127.0.0.1:\(activeMixedPort)" }
-
-    var activeLANInterfaces: [NetworkInterfaceInfo] {
-        interfaces.filter { $0.isUpWithAddress && $0.ipv4Address != nil }
+    var activeRemoteHost: RemoteSavedHost? {
+        guard case .remote(let hostId) = selectedDevice else { return nil }
+        return remoteClient.savedHosts.first { $0.id == hostId }
     }
 
-    var lanIPAddresses: [String] {
-        activeLANInterfaces.compactMap(\.ipv4Address)
+    var currentDeviceDisplayName: String { activeSession.deviceDisplayName }
+
+    var activeLiveProxyStore: LiveProxyStore { activeSession.liveProxyStore }
+    var activeConnectionMonitor: ConnectionMonitorService { activeSession.connectionMonitor }
+    var activeSubscriptionStore: SubscriptionStore { activeSession.subscriptionStore }
+    var activeLogStore: EngineLogStore { activeSession.logStore }
+    var activeGatewayDeviceStore: GatewayDeviceStore { activeSession.gatewayDeviceStore }
+
+    // MARK: - Local Store & Property Forwarders (for Local Controls, MenuBar & RemoteServerService)
+
+    var engine: EngineController { localSession.engine }
+    var liveProxyStore: LiveProxyStore { localSession.liveProxyStore }
+    var coreBinaryStore: CoreBinaryStore { localSession.coreBinaryStore }
+    var subscriptionStore: SubscriptionStore { localSession.subscriptionStore }
+    var connectionMonitor: ConnectionMonitorService { localSession.connectionMonitor }
+    var gatewayDeviceStore: GatewayDeviceStore { localSession.gatewayDeviceStore }
+
+    var localProfile: RoutingProfile { localSession.localProfile }
+    var controllerPort: Int { localSession.controllerPort }
+    var customProfileDirectory: URL? { localSession.customProfileDirectory }
+    var autoStartCoreOnLaunch: Bool { localSession.autoStartCoreOnLaunch }
+    var systemKeepAliveEnabled: Bool { localSession.systemKeepAliveEnabled }
+    var launchAtLoginStatus: LaunchAtLoginStatus { localSession.launchAtLoginStatus }
+    var interfaces: [NetworkInterfaceInfo] { localSession.interfaces }
+    var hasPendingHotReload: Bool { localSession.hasPendingHotReload }
+    var isHotReloading: Bool { activeSession.isHotReloading }
+    var updatingGeoResources: Bool { localSession.updatingGeoResources }
+    var geoUpdateMessage: String? { localSession.geoUpdateMessage }
+    var tunPermissionStatus: TunPermissionStatus { localSession.tunPermissionStatus }
+    var isAuthorizingTun: Bool { localSession.isAuthorizingTun }
+    var killSwitchActive: Bool { localSession.killSwitchActive }
+    var killSwitchAllowLAN: Bool { localSession.killSwitchAllowLAN }
+    var killSwitchPersistOnBoot: Bool { localSession.killSwitchPersistOnBoot }
+    var isUpdatingKillSwitch: Bool { localSession.isUpdatingKillSwitch }
+    var isIPForwardingEnabled: Bool { localSession.isIPForwardingEnabled }
+    var configValidationError: String? { localSession.configValidationError }
+    var binary: URL? { localSession.binary }
+    var activeProfileDirectory: URL { localSession.activeProfileDirectory }
+    var savedProfileURL: URL { localSession.savedProfileURL }
+    var isUsingCustomProfileDirectory: Bool { localSession.isUsingCustomProfileDirectory }
+
+    var gatewayDevices: [GatewayClientDevice] { localSession.gatewayDeviceStore.devices }
+    var includeARPOnlyGatewayDevices: Bool {
+        get { activeSession.gatewayDeviceStore.includeARPOnly }
+        set {
+            activeSession.gatewayDeviceStore.includeARPOnly = newValue
+            refreshGatewayDevices()
+        }
     }
 
-    var primaryLANInterface: NetworkInterfaceInfo? {
-        activeLANInterfaces.first
-    }
+    var localActiveLANInterfaces: [NetworkInterfaceInfo] { localSession.activeLANInterfaces }
+    var localLANIPAddresses: [String] { localSession.lanIPAddresses }
+    var localPrimaryLANInterface: NetworkInterfaceInfo? { localSession.primaryLANInterface }
+    var localPrimaryLANAddress: String? { localSession.primaryLANAddress }
+    var localEditingLocked: Bool { localSession.editingLocked }
+    var localCanStart: Bool { localSession.canStart }
 
-    var primaryLANAddress: String? {
-        lanIPAddresses.first
-    }
+    // MARK: - Unified Active Device Properties (Delegated to activeSession)
+
+    /// True while this Mac's local Mihomo core is running or starting/stopping.
+    var isLocalCoreActive: Bool { engine.isRunning || engine.isBusy }
+
+    /// True while this Mac's system HTTP proxy / SOCKS5 / gateway is routed to a remote device.
+    var isRemoteBridgeActive: Bool { remoteBridge.activeLink != nil }
+
+    /// Mutual exclusion: cannot configure this Mac's HTTP proxy or gateway to a remote device while local core is active.
+    var canConfigureRemoteBridge: Bool { !isLocalCoreActive }
+
+    var isCoreRunning: Bool { activeSession.isCoreRunning }
+    var isCoreBusy: Bool { activeSession.isCoreBusy }
+    var corePhaseTitle: String { activeSession.corePhaseTitle }
+    var isTunActive: Bool { activeSession.isTunActive }
+    var isGatewayActive: Bool { activeSession.isGatewayActive }
+    var isLaunchdManaged: Bool { activeSession.isLaunchdManaged }
+    var coreLastError: String? { activeSession.coreLastError }
+    var activeHasPendingHotReload: Bool { activeSession.hasPendingHotReload }
+    var activeConfigValidationError: String? { activeSession.configValidationError }
+    var activeKillSwitchActive: Bool { activeSession.killSwitchActive }
+    var activeKillSwitchAllowLAN: Bool { activeSession.killSwitchAllowLAN }
+    var activeKillSwitchPersistOnBoot: Bool { activeSession.killSwitchPersistOnBoot }
+    var activeIsIPForwardingEnabled: Bool { activeSession.isIPForwardingEnabled }
+    var activeControllerPort: Int { activeSession.controllerPort }
+    var activeAutoStartCoreOnLaunch: Bool { activeSession.autoStartCoreOnLaunch }
+    var activeSystemKeepAliveEnabled: Bool { activeSession.systemKeepAliveEnabled }
+    var activeLaunchAtLoginEnabled: Bool { activeSession.launchAtLoginEnabled }
+    var activeTunPermissionReady: Bool { activeSession.tunPermissionReady }
+    var activeTunPermissionTitle: String { activeSession.tunPermissionTitle }
+    var activeInterfaces: [NetworkInterfaceInfo] { activeSession.interfaces }
+    var activeGatewayDevices: [GatewayClientDevice] { activeSession.gatewayDeviceStore.devices }
+    var editingLocked: Bool { activeSession.editingLocked }
+    var hotReloadEditingLocked: Bool { activeSession.hotReloadEditingLocked }
+    var activeMixedPort: Int { activeSession.mixedPort }
+    var localProxyAddress: String { activeSession.proxyAddress }
+    var activeLANInterfaces: [NetworkInterfaceInfo] { activeSession.activeLANInterfaces }
+    var lanIPAddresses: [String] { activeSession.lanIPAddresses }
+    var primaryLANInterface: NetworkInterfaceInfo? { activeSession.primaryLANInterface }
+    var primaryLANAddress: String? { activeSession.primaryLANAddress }
+    var canStart: Bool { activeSession.canStart }
+    var readinessItems: [ReadinessItem] { activeSession.readinessItems(for: profile) }
 
     var missingInterfaces: [String] {
-        let active = Set(interfaces.filter(\.isUpWithAddress).map(\.bsdName))
+        let active = Set(activeInterfaces.filter(\.isUpWithAddress).map(\.bsdName))
         return profile.requiredInterfaces.filter { !active.contains($0) }.sorted()
     }
 
-    var canStart: Bool {
-        let tunReady = !profile.effectiveTunEnabled || tunPermissionStatus.isReady
-        return !engine.isBusy && !isAuthorizingTun && binary != nil && configValidationError == nil && missingInterfaces.isEmpty && tunReady
+    // MARK: - Gateway Device Label Helpers (Delegated to GatewayDeviceStore)
+
+    var lanDeviceNamesByIP: [String: String] {
+        activeSession.gatewayDeviceStore.lanDeviceNamesByIP
     }
 
-    var readinessItems: [ReadinessItem] {
-        let hasBinary = binary.map { FileManager.default.isExecutableFile(atPath: $0.path) } ?? false
-        let binaryDetail: String
-        if hasBinary {
-            let ver = coreBinaryStore.version.map { " (\($0))" } ?? ""
-            binaryDetail = "\(coreBinaryStore.source.title)\(ver)"
-        } else {
-            binaryDetail = "尚未安装 Mihomo 内核，可在设置页一键下载"
-        }
-        let binaryItem = ReadinessItem(
-            id: "binary",
-            title: "Mihomo 内核",
-            detail: binaryDetail,
-            isReady: hasBinary,
-            targetSection: .settings
-        )
-
-        let required = profile.requiredInterfaces
-        let interfaceReady = missingInterfaces.isEmpty
-        let interfaceDetail: String
-        if required.isEmpty {
-            interfaceDetail = "使用系统默认网卡（未强制绑定）"
-        } else if !missingInterfaces.isEmpty {
-            interfaceDetail = "绑定网卡不可用或无 IP：\(missingInterfaces.joined(separator: "、"))"
-        } else {
-            interfaceDetail = "已绑定：\(required.sorted().joined(separator: " / "))"
-        }
-        let interfaceItem = ReadinessItem(
-            id: "interfaces",
-            title: "网卡状态",
-            detail: interfaceDetail,
-            isReady: interfaceReady,
-            targetSection: .targets
-        )
-
-        let configErr = configValidationError
-        let configReady = configErr == nil
-        let targetSection: SidebarSection = profile.subscriptions.isEmpty ? .subscriptions : .targets
-        let configItem = ReadinessItem(
-            id: "config",
-            title: "路由与订阅配置",
-            detail: configErr ?? "配置有效，共 \(profile.ruleGroups.filter(\.isEnabled).count) 个启用规则组",
-            isReady: configReady,
-            targetSection: targetSection
-        )
-
-        var items = [binaryItem, interfaceItem, configItem]
-        if profile.effectiveTunEnabled {
-            items.append(
-                ReadinessItem(
-                    id: "tun",
-                    title: profile.gatewayModeEnabled ? "局域网网关 / TUN 权限" : "TUN 透明代理权限",
-                    detail: tunPermissionStatus.detail,
-                    isReady: tunPermissionStatus.isReady,
-                    targetSection: .settings
-                )
-            )
-        }
-        if profile.gatewayModeEnabled && lanIPAddresses.isEmpty {
-            items.append(
-                ReadinessItem(
-                    id: "gateway-lan",
-                    title: "局域网网关接口",
-                    detail: "未检测到活跃局域网 IPv4 地址，局域网其他设备将无法接入本机网关。",
-                    isReady: false,
-                    targetSection: .settings
-                )
-            )
-        }
-        return items
+    func clientDisplayLabel(for clientKey: String) -> String {
+        activeSession.gatewayDeviceStore.clientDisplayLabel(for: clientKey)
     }
+
+    func clientShortLabel(for clientKey: String) -> String {
+        activeSession.gatewayDeviceStore.clientShortLabel(for: clientKey)
+    }
+
+    func connectionClientKey(for item: MonitoredConnection) -> String {
+        activeSession.gatewayDeviceStore.connectionClientKey(for: item, localIPs: Set(lanIPAddresses))
+    }
+
+    /// Returns a display label only when the connection originates from another LAN device (nil for local machine).
+    func connectionLANClientLabel(for item: MonitoredConnection) -> String? {
+        activeSession.gatewayDeviceStore.connectionLANClientLabel(for: item, localIPs: Set(lanIPAddresses))
+    }
+
+    // MARK: - Initialization
 
     init(
         engine: EngineController? = nil,
         liveProxyStore: LiveProxyStore? = nil,
         connectionMonitor: ConnectionMonitorService? = nil,
+        remoteClient: RemoteClientService? = nil,
+        remoteBridge: RemoteNetworkBridge? = nil,
+        gatewayInspector: any GatewayDeviceInspecting = SystemGatewayDeviceInspector(),
+        routingSnapshotProvider: (() -> SystemNetworkRoutingSnapshot)? = nil,
+        userDefaults: UserDefaults = .standard,
         bootstrapOnInit: Bool = true
     ) {
-        self.engine = engine ?? EngineController()
-        self.liveProxyStore = liveProxyStore ?? LiveProxyStore()
-        self.connectionMonitor = connectionMonitor ?? ConnectionMonitorService()
+        let resolvedRemoteClient = remoteClient ?? RemoteClientService(
+            localDeviceId: remoteServer.deviceId,
+            localDeviceName: remoteServer.hostDisplayName
+        )
+        self.remoteClient = resolvedRemoteClient
+        let resolvedBridge = remoteBridge ?? RemoteNetworkBridge(
+            linkStore: UserDefaultsRemoteNetworkLinkStore(defaults: userDefaults)
+        )
+        self.remoteBridge = resolvedBridge
+        self.routingSnapshotProvider = routingSnapshotProvider ?? (
+            bootstrapOnInit ? NetworkEnvironment.currentRoutingSnapshot : { SystemNetworkRoutingSnapshot() }
+        )
+
+        weak var weakBridge: RemoteNetworkBridge?
+        let localGatewayStore = GatewayDeviceStore(inspector: gatewayInspector)
+        self.localSession = LocalDeviceSession(
+            engine: engine,
+            liveProxyStore: liveProxyStore,
+            connectionMonitor: connectionMonitor,
+            gatewayDeviceStore: localGatewayStore,
+            userDefaults: userDefaults,
+            bootstrapOnInit: bootstrapOnInit,
+            activeRemoteBridgeDescriptionProvider: {
+                guard let link = weakBridge?.activeLink else { return nil }
+                return "远程设备「\(link.remoteHostName)」的\(link.mode.title)"
+            }
+        )
+        self.remoteSession = RemoteDeviceSession(remoteClient: resolvedRemoteClient)
+        weakBridge = resolvedBridge
+
+        self.localSession.delegate = self
+        self.remoteSession.delegate = self
+
+        self.isSyncingDeviceContext = true
+        self.profile = self.localSession.localProfile
+        self.isSyncingDeviceContext = false
+
         if bootstrapOnInit {
-            restoreState()
-            recomputeConfigValidation()
-            refreshInterfaces()
-            startInterfaceMonitoring()
-            refreshResolvedBinary()
-            refreshLaunchAtLoginStatus()
-            refreshKillSwitchStatus()
-            subscriptionStore.loadCache(in: activeProfileDirectory)
-            self.connectionMonitor.configureHistory(directory: activeProfileDirectory)
-            startInitialCoreBootstrap()
-        } else {
-            recomputeConfigValidation()
+            remoteServer.attach(appState: self)
         }
 
-        // Only low-frequency engine lifecycle state lives on EngineController (logs live in EngineLogStore).
-        self.engine.objectWillChange
+        if bootstrapOnInit || remoteBridge != nil || routingSnapshotProvider != nil {
+            syncSelectedDeviceOnWindowOpen()
+        }
+
+        self.remoteBridge.objectWillChange
             .sink { [weak self] _ in
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
+    }
 
-        // Forward resolved binary changes so OverviewView / MenuBarExtra stay in sync without observing update progress.
-        coreBinaryStore.$binary
-            .dropFirst()
-            .sink { [weak self] _ in
-                self?.refreshTunPermissionStatus()
-                self?.objectWillChange.send()
+    // MARK: - DeviceSessionDelegate
+
+    func deviceSession(_ session: any DeviceSession, didEmitFeedback message: String) {
+        guard session === activeSession || !session.isRemote else { return }
+        showFeedback(message)
+    }
+
+    func deviceSession(_ session: any DeviceSession, didEmitAlert message: String) {
+        guard session === activeSession || !session.isRemote else { return }
+        alertText = message
+    }
+
+    func deviceSessionDidChangeState(_ session: any DeviceSession) {
+        guard session === activeSession || !session.isRemote else { return }
+        objectWillChange.send()
+    }
+
+    func deviceSession(_ session: any DeviceSession, didSyncProfile syncedProfile: RoutingProfile) {
+        guard session === activeSession else { return }
+        isSyncingDeviceContext = true
+        profile = syncedProfile
+        isSyncingDeviceContext = false
+    }
+
+    func deviceSessionDidLoseRemoteHost(_ session: any DeviceSession) {
+        guard session === remoteSession, isViewingRemote else { return }
+        selectDevice(.local, userInitiated: false)
+    }
+
+    func deviceSessionDidReattachLocalCore(_ session: LocalDeviceSession) {
+        guard !hasUserManuallySelectedDevice else { return }
+        selectDevice(.local, userInitiated: false)
+    }
+
+    // MARK: - Device Switching
+
+    func selectDevice(_ device: ManagedDevice, userInitiated: Bool = true) {
+        if userInitiated {
+            hasUserManuallySelectedDevice = true
+        }
+        guard selectedDevice != device else { return }
+        selectedDevice = device
+        switch device {
+        case .local:
+            remoteSession.deactivate()
+            isSyncingDeviceContext = true
+            profile = localSession.localProfile
+            isSyncingDeviceContext = false
+        case .remote(let hostId):
+            remoteSession.activate(hostId: hostId)
+        }
+        objectWillChange.send()
+    }
+
+    /// Resolves which device (local Mac vs. a paired remote host) is currently providing network routing/proxy
+    /// for this Mac, checking local Mihomo state, live macOS gateway/proxy settings, and `RemoteNetworkBridge`.
+    func resolveActiveDeviceInUse() -> ManagedDevice {
+        if isLocalCoreActive {
+            return .local
+        }
+        let savedHosts = remoteClient.savedHosts
+        guard !savedHosts.isEmpty else {
+            return .local
+        }
+
+        let routing = routingSnapshotProvider()
+        let ignoredEndpoints = Set(localSession.lanIPAddresses.map { $0.lowercased() })
+            .union(["127.0.0.1", "::1", "localhost"])
+
+        func matchingSavedHost(for rawEndpoint: String?) -> RemoteSavedHost? {
+            guard let ep = rawEndpoint?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !ep.isEmpty,
+                  !ignoredEndpoints.contains(ep.lowercased()) else {
+                return nil
             }
-            .store(in: &cancellables)
-
-        coreBinaryStore.$version
-            .dropFirst()
-            .sink { [weak self] _ in
-                self?.objectWillChange.send()
+            if let direct = savedHosts.first(where: { $0.host.caseInsensitiveCompare(ep) == .orderedSame }) {
+                return direct
             }
-            .store(in: &cancellables)
-
-        self.engine.$phase
-            .removeDuplicates()
-            .sink { [weak self] newPhase in
-                guard let self else { return }
-                if newPhase == .running {
-                    self.refreshIPForwardingStatus()
-                    self.liveProxyStore.startPolling { [weak self] in self?.engine.isRunning ?? false }
-                    if let active = self.liveProxyStore.controller {
-                        self.connectionMonitor.start(controller: active)
-                    }
-                } else if newPhase == .idle {
-                    self.refreshIPForwardingStatus()
-                    self.connectionMonitor.stop()
-                    self.liveProxyStore.reset()
-                    self.runningProfileSnapshot = nil
-                    self.hasPendingHotReload = false
-                    self.isHotReloading = false
-                    self.coreBinaryStore.handleEngineStopped()
+            for host in savedHosts {
+                if let discovered = remoteClient.discoveredDevices.first(where: { $0.id == host.id }),
+                   discovered.ips.contains(where: { $0.caseInsensitiveCompare(ep) == .orderedSame }) {
+                    return host
                 }
             }
-            .store(in: &cancellables)
-
-        self.engine.$lastCoreRestartToken
-            .dropFirst()
-            .sink { [weak self] _ in
-                guard let self, self.engine.isRunning, let active = self.liveProxyStore.controller else { return }
-                self.connectionMonitor.stop()
-                self.connectionMonitor.start(controller: active)
-                self.liveProxyStore.startPolling { [weak self] in self?.engine.isRunning ?? false }
-                self.showFeedback("Mihomo 核心异常退出，已由系统级 launchd 自动拉起")
-            }
-            .store(in: &cancellables)
-    }
-
-    private func recomputeConfigValidation() {
-        do {
-            _ = try MihomoConfig.renderDetailed(profile, controllerPort: controllerPort, secret: "validation-probe")
-            configValidationError = nil
-        } catch {
-            configValidationError = error.localizedDescription
+            return nil
         }
-    }
 
-    func refreshInterfaces() {
-        let updated = NetworkEnvironment.detailedInterfaces()
-        if interfaces != updated {
-            interfaces = updated
-        }
-        refreshIPForwardingStatus()
-    }
-
-    func refreshIPForwardingStatus() {
-        let enabled = NetworkEnvironment.isIPForwardingEnabled()
-        if isIPForwardingEnabled != enabled {
-            isIPForwardingEnabled = enabled
-        }
-    }
-
-    func setTunEnabled(_ enabled: Bool) {
-        guard !editingLocked else { return }
-        profile.setTunEnabled(enabled)
-    }
-
-    func setGatewayModeEnabled(_ enabled: Bool) {
-        guard !editingLocked else { return }
-        profile.setGatewayModeEnabled(enabled)
-    }
-
-    private func startInterfaceMonitoring() {
-        pathMonitor.pathUpdateHandler = { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.refreshInterfaces()
+        // 1. Live system default gateway or active HTTP/HTTPS/SOCKS proxy matching a paired remote host
+        for endpoint in [routing.defaultGatewayIPv4, routing.httpProxyServer, routing.httpsProxyServer, routing.socksProxyServer] {
+            if let matched = matchingSavedHost(for: endpoint) {
+                return .remote(matched.id)
             }
         }
-        pathMonitor.start(queue: pathMonitorQueue)
+
+        // 2. Persisted RemoteNetworkBridge link (when not superseded by a different live system gateway/proxy)
+        if let link = remoteBridge.activeLink {
+            let linkStillConsistent: Bool
+            switch link.mode {
+            case .gateway:
+                linkStillConsistent = routing.defaultGatewayIPv4 == nil
+                    || routing.defaultGatewayIPv4?.caseInsensitiveCompare(link.remoteIP) == .orderedSame
+            case .httpProxy:
+                linkStillConsistent = (routing.httpProxyServer == nil && routing.httpsProxyServer == nil && routing.defaultGatewayIPv4 == nil)
+                    || routing.httpProxyServer?.caseInsensitiveCompare(link.remoteIP) == .orderedSame
+                    || routing.httpsProxyServer?.caseInsensitiveCompare(link.remoteIP) == .orderedSame
+            case .socks5:
+                linkStillConsistent = (routing.socksProxyServer == nil && routing.defaultGatewayIPv4 == nil)
+                    || routing.socksProxyServer?.caseInsensitiveCompare(link.remoteIP) == .orderedSame
+            }
+            if linkStillConsistent,
+               let matched = savedHosts.first(where: {
+                   $0.id == link.remoteHostId || $0.host.caseInsensitiveCompare(link.remoteIP) == .orderedSame
+               }) {
+                return .remote(matched.id)
+            }
+        }
+
+        return .local
     }
 
-    deinit {
-        pathMonitor.cancel()
+    /// Automatically switches `selectedDevice` to whichever device is actively in use when launching or opening the window.
+    func syncSelectedDeviceOnWindowOpen() {
+        let target = resolveActiveDeviceInUse()
+        selectDevice(target, userInitiated: false)
     }
+
+    func syncRemoteMirrors() {
+        guard isViewingRemote else { return }
+        remoteSession.syncFromClient()
+    }
+
+    // MARK: - Remote Network Bridge (Mutually Exclusive with Local Core)
+
+    func connectRemoteAsHTTPProxy(port: Int? = nil) {
+        guard let host = activeRemoteHost else { return }
+        guard !isLocalCoreActive else {
+            alertText = "本机核心正在运行，请先停止本机核心后再将本机 HTTP 代理切换至远程设备。"
+            return
+        }
+        let targetPort = port ?? remoteClient.remoteFullState?.profile.httpPort ?? remoteClient.remoteStatus?.mixedPort ?? profile.mixedPort
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await self.remoteBridge.connectAsHTTPProxy(
+                host: host,
+                port: targetPort,
+                preferredBSDInterface: self.localPrimaryLANInterface?.bsdName
+            )
+            if ok, let fb = self.remoteBridge.feedback {
+                self.showFeedback(fb)
+            } else if let err = self.remoteBridge.lastError {
+                self.alertText = err
+            }
+            self.objectWillChange.send()
+        }
+    }
+
+    func connectRemoteAsGateway() {
+        guard let host = activeRemoteHost else { return }
+        guard !isLocalCoreActive else {
+            alertText = "本机核心正在运行，请先停止本机核心后再将本机网关切换至远程设备。"
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await self.remoteBridge.connectAsGateway(
+                host: host,
+                preferredBSDInterface: self.localPrimaryLANInterface?.bsdName
+            )
+            if ok, let fb = self.remoteBridge.feedback {
+                self.showFeedback(fb)
+            } else if let err = self.remoteBridge.lastError {
+                self.alertText = err
+            }
+            self.objectWillChange.send()
+        }
+    }
+
+    func disconnectRemoteBridge() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await self.remoteBridge.disconnectAndRestore()
+            if ok, let fb = self.remoteBridge.feedback {
+                self.showFeedback(fb)
+            } else if let err = self.remoteBridge.lastError {
+                self.alertText = err
+            }
+            self.objectWillChange.send()
+        }
+    }
+
+    // MARK: - Delegated Device Actions
+
+    func refreshGatewayDevices() { activeSession.refreshGatewayDevices() }
+    func refreshInterfaces() { localSession.refreshInterfaces() }
+    func refreshIPForwardingStatus() { localSession.refreshIPForwardingStatus() }
+
+    func updateLocalProfileFromRemote(_ updated: RoutingProfile) {
+        localSession.updateLocalProfileFromRemote(updated)
+    }
+
+    func setTunEnabled(_ enabled: Bool) { activeSession.setTunEnabled(enabled) }
+    func setLocalTunEnabled(_ enabled: Bool) { localSession.setTunEnabled(enabled) }
+    func setGatewayModeEnabled(_ enabled: Bool) { activeSession.setGatewayModeEnabled(enabled) }
+    func setLocalGatewayModeEnabled(_ enabled: Bool) { localSession.setGatewayModeEnabled(enabled) }
+
+    func fetchSubscriptionNodes(_ sub: ProxySubscription) { activeSession.fetchSubscriptionNodes(sub) }
+    func fetchLocalSubscriptionNodes(_ sub: ProxySubscription) { localSession.fetchSubscriptionNodes(sub) }
+    func fetchAllSubscriptionNodes() { activeSession.fetchAllSubscriptionNodes() }
+    func fetchAllLocalSubscriptionNodes() { localSession.fetchAllSubscriptionNodes() }
+
+    func refreshAllHostModules() { activeSession.refreshAllHostModules() }
+    func refreshAllLocalHostModules() { localSession.refreshAllHostModules() }
+    func refreshHostModule(id: UUID) { activeSession.refreshHostModule(id: id) }
+    func refreshLocalHostModule(id: UUID) { localSession.refreshHostModule(id: id) }
+
+    func refreshResolvedBinary() { localSession.refreshResolvedBinary() }
+    func refreshLaunchAtLoginStatus() { localSession.refreshLaunchAtLoginStatus() }
+    func setLaunchAtLogin(_ enabled: Bool) { activeSession.setLaunchAtLogin(enabled) }
+    func setLocalLaunchAtLogin(_ enabled: Bool) { localSession.setLaunchAtLogin(enabled) }
+    func setAutoStartCoreOnLaunch(_ enabled: Bool) { activeSession.setAutoStartCoreOnLaunch(enabled) }
+    func setLocalAutoStartCoreOnLaunch(_ enabled: Bool) { localSession.setAutoStartCoreOnLaunch(enabled) }
+    func setSystemKeepAliveEnabled(_ enabled: Bool) { activeSession.setSystemKeepAliveEnabled(enabled) }
+    func setLocalSystemKeepAliveEnabled(_ enabled: Bool) { localSession.setSystemKeepAliveEnabled(enabled) }
+    func setControllerPort(_ port: Int) { activeSession.setControllerPort(port) }
+    func setLocalControllerPort(_ port: Int) { localSession.setControllerPort(port) }
+
+    func openLoginItemsSettings() { LaunchAtLoginManager.openSystemSettingsLoginItems() }
+
+    @discardableResult
+    func reattachRunningCoreIfNeeded() async -> Bool {
+        await localSession.reattachRunningCoreIfNeeded()
+    }
+
+    var shouldConfirmCoreOnQuit: Bool { engine.isRunning || engine.isBusy }
+    func prepareForQuit(stopCore: Bool) { localSession.prepareForQuit(stopCore: stopCore) }
+
+    func refreshTunPermissionStatus() { localSession.refreshTunPermissionStatus() }
+    func authorizeTun() { localSession.authorizeTun() }
+    func revokeTunAuthorization() { localSession.revokeTunAuthorization() }
+
+    func refreshKillSwitchStatus() { localSession.refreshKillSwitchStatus() }
+    func setKillSwitchEnabled(_ enabled: Bool) { activeSession.setKillSwitchEnabled(enabled) }
+    func setLocalKillSwitchEnabled(_ enabled: Bool) { localSession.setKillSwitchEnabled(enabled) }
+    func setKillSwitchAllowLAN(_ allow: Bool) { activeSession.setKillSwitchAllowLAN(allow) }
+    func setLocalKillSwitchAllowLAN(_ allow: Bool) { localSession.setKillSwitchAllowLAN(allow) }
+    func setKillSwitchPersistOnBoot(_ persist: Bool) { activeSession.setKillSwitchPersistOnBoot(persist) }
+    func setLocalKillSwitchPersistOnBoot(_ persist: Bool) { localSession.setKillSwitchPersistOnBoot(persist) }
+
+    func resetToBundledCore() { localSession.resetToBundledCore() }
+    func checkForCoreUpdate() { activeSession.checkForCoreUpdate() }
+    func checkForLocalCoreUpdate() { localSession.checkForCoreUpdate() }
+    func installCoreUpdate() { activeSession.installCoreUpdate() }
+    func installLocalCoreUpdate() { localSession.installCoreUpdate() }
+
+    func validate() { activeSession.validate() }
+    func validateLocal() { localSession.validate() }
+    func start() { activeSession.start() }
+    func startLocal() { localSession.start() }
+    func hotReload() { activeSession.hotReload() }
+    func hotReloadLocal() { localSession.hotReload() }
+    func hotReloadLocalFromRemote() async -> RemoteActionResult { await localSession.hotReloadFromRemote() }
+    func stop() { activeSession.stop() }
+    func stopLocal() { localSession.stop() }
+    func clearActiveLog() { activeSession.clearLog() }
+
+    func refreshGroups() { activeSession.refreshGroups() }
+    func selectNode(group: String, node: String) { activeSession.selectNode(group: group, node: node) }
+    func selectLocalNode(group: String, node: String) { localSession.selectNode(group: group, node: node) }
+    func testGroupDelay(group: String) { activeSession.testGroupDelay(group: group) }
+    func testLocalGroupDelay(group: String) { localSession.testGroupDelay(group: group) }
+    func diagnoseTargetHops(targetName: String) { activeSession.diagnoseTargetHops(targetName: targetName) }
+    func diagnoseAllActiveHops() { activeSession.diagnoseAllActiveHops() }
+    func clearOutboundErrors() { activeSession.clearOutboundErrors() }
+
+    func openTopology(focusingTarget targetKey: String? = nil) {
+        if let targetKey {
+            selectedTopologyTargetKey = targetKey
+        }
+        selectedSection = .topology
+    }
+
+    func buildTopologySnapshot() -> TopologySnapshot {
+        let upInterfaces = Set(activeInterfaces.filter(\.isUpWithAddress).map(\.bsdName))
+        var labels: [String: String] = [:]
+        for info in activeInterfaces {
+            labels[info.bsdName] = info.shortLabel
+        }
+        return TopologySnapshotBuilder.build(
+            profile: profile,
+            isCoreRunning: isCoreRunning,
+            activeInterfaceNames: upInterfaces,
+            interfaceLabels: labels,
+            groupStatuses: activeLiveProxyStore.healthSnapshots,
+            tracker: activeConnectionMonitor.tracker,
+            dnsRecords: activeConnectionMonitor.dnsLogs,
+            outboundErrorTracker: activeConnectionMonitor.outboundErrorTracker,
+            ruleIndex: ruleMatchDisplayIndex
+        )
+    }
+    func updateOnlineRuleProviders() { activeSession.updateOnlineRuleProviders() }
+    func updateLocalOnlineRuleProviders() { localSession.updateOnlineRuleProviders() }
+    func updateGeoResources() { activeSession.updateGeoResources() }
+    func updateLocalGeoResources() { localSession.updateGeoResources() }
+    func closeMonitoredConnection(id: String) { activeSession.closeMonitoredConnection(id: id) }
+    func closeAllMonitoredConnections() { activeSession.closeAllMonitoredConnections() }
+    func flushDNSCache(includeFakeIP: Bool = false) { activeSession.flushDNSCache(includeFakeIP: includeFakeIP) }
+    func clearDNSLogsAndCache(includeFakeIP: Bool = false) { activeSession.clearDNSLogsAndCache(includeFakeIP: includeFakeIP) }
+
+    // MARK: - Interface & Target Preview Helpers
 
     func interfaceDisplayLabel(for bsdName: String?) -> String {
         guard let bsd = bsdName?.trimmingCharacters(in: .whitespacesAndNewlines), !bsd.isEmpty else {
             return "系统默认网卡"
         }
-        if let info = interfaces.first(where: { $0.bsdName == bsd }) {
+        if let info = activeInterfaces.first(where: { $0.bsdName == bsd }) {
             return info.shortLabel
         }
         return bsd
@@ -444,7 +696,7 @@ final class AppState: ObservableObject {
         targetChainPreview(for: target).steps
     }
 
-    // MARK: - Quick Mutations
+    // MARK: - Quick Profile Mutations
 
     func removeRelay(fromTargetID id: UUID) {
         guard let name = profile.removeRelay(fromTargetID: id) else { return }
@@ -470,81 +722,19 @@ final class AppState: ObservableObject {
         )
     }
 
-    // MARK: - Subscription Node Preview
-
     func nodes(forSubscriptionID id: UUID?) -> [SubscriptionNode] {
-        subscriptionStore.nodes(forSubscriptionID: id)
+        activeSubscriptionStore.nodes(forSubscriptionID: id)
     }
 
     func matchedNodes(for group: NodeGroup) -> [SubscriptionNode]? {
-        subscriptionStore.matchedNodes(for: group)
+        activeSubscriptionStore.matchedNodes(for: group)
     }
 
-    func fetchSubscriptionNodes(_ sub: ProxySubscription) {
-        let fallbackProxyPort = engine.isRunning ? activeMixedPort : nil
-        subscriptionStore.fetchSubscriptionNodes(
-            sub,
-            fallbackProxyPort: fallbackProxyPort,
-            cacheDirectory: activeProfileDirectory
-        ) { [weak self] message in
-            self?.showFeedback(message)
-        }
-    }
-
-    func fetchAllSubscriptionNodes() {
-        for sub in profile.subscriptions {
-            fetchSubscriptionNodes(sub)
-        }
-    }
-
-    func deleteHostModule(id: UUID) {
-        profile.hostModules.removeAll { $0.id == id }
-    }
-
-    func refreshAllHostModules() {
-        for module in profile.hostModules where !subscriptionStore.updatingHostModuleIDs.contains(module.id) {
-            refreshHostModule(id: module.id)
-        }
-    }
-
-    func refreshHostModule(id: UUID) {
-        guard let idx = profile.hostModules.firstIndex(where: { $0.id == id }) else { return }
-        let rawURL = profile.hostModules[idx].url
-        subscriptionStore.refreshHostModule(
-            id: id,
-            rawURL: rawURL,
-            onParsed: { [weak self] parsed, url in
-                guard let self, let currentIdx = self.profile.hostModules.firstIndex(where: { $0.id == id }) else { return }
-                self.profile.hostModules[currentIdx].cachedHosts = parsed.hosts
-                self.profile.hostModules[currentIdx].lastUpdated = Date()
-                if self.profile.hostModules[currentIdx].name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   let parsedName = parsed.name {
-                    self.profile.hostModules[currentIdx].name = parsedName
-                }
-                let displayName = self.profile.hostModules[currentIdx].name.isEmpty ? url.lastPathComponent : self.profile.hostModules[currentIdx].name
-                self.showFeedback("已更新「\(displayName)」：解析出 \(parsed.hosts.count) 条有效 Host 映射")
-            },
-            onError: { [weak self] message in
-                self?.alertText = message
-            }
-        )
-    }
-
-    func deleteNodeGroup(id: UUID) {
-        profile.deleteNodeGroup(id: id)
-    }
-
-    func deleteTarget(id: UUID) {
-        profile.deleteTarget(id: id)
-    }
-
-    func deleteCustomDNSEntry(id: UUID) {
-        profile.deleteCustomDNSEntry(id: id)
-    }
-
-    func upsertCustomDNSEntry(_ entry: CustomDNSEntry) {
-        profile.upsertCustomDNSEntry(entry)
-    }
+    func deleteHostModule(id: UUID) { profile.hostModules.removeAll { $0.id == id } }
+    func deleteNodeGroup(id: UUID) { profile.deleteNodeGroup(id: id) }
+    func deleteTarget(id: UUID) { profile.deleteTarget(id: id) }
+    func deleteCustomDNSEntry(id: UUID) { profile.deleteCustomDNSEntry(id: id) }
+    func upsertCustomDNSEntry(_ entry: CustomDNSEntry) { profile.upsertCustomDNSEntry(entry) }
 
     func fixSwappedCustomDNSHosts() {
         let fixedCount = profile.fixSwappedCustomDNSHosts()
@@ -564,382 +754,6 @@ final class AppState: ObservableObject {
         }
     }
 
-    // MARK: - Core Binary Management & In-App Updater
-
-    func refreshResolvedBinary() {
-        coreBinaryStore.refresh()
-        refreshTunPermissionStatus()
-    }
-
-    func refreshLaunchAtLoginStatus() {
-        launchAtLoginStatus = LaunchAtLoginManager.currentStatus()
-    }
-
-    func setLaunchAtLogin(_ enabled: Bool) {
-        do {
-            launchAtLoginStatus = try LaunchAtLoginManager.setEnabled(enabled)
-            if enabled && !autoStartCoreOnLaunch {
-                autoStartCoreOnLaunch = true
-            }
-            if launchAtLoginStatus == .requiresApproval {
-                showFeedback("已注册开机自启，请在系统设置「登录项」中允许")
-            } else {
-                showFeedback(enabled ? "已开启开机自动启动" : "已关闭开机自动启动")
-            }
-        } catch {
-            refreshLaunchAtLoginStatus()
-            alertText = "设置开机自动启动失败：\(error.localizedDescription)"
-        }
-    }
-
-    func openLoginItemsSettings() {
-        LaunchAtLoginManager.openSystemSettingsLoginItems()
-    }
-
-    private func startInitialCoreBootstrap() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let attached = await self.reattachRunningCoreIfNeeded()
-            if !attached {
-                self.scheduleAutoStartCoreIfNeeded()
-            }
-        }
-    }
-
-    @discardableResult
-    func reattachRunningCoreIfNeeded() async -> Bool {
-        guard let reattached = await engine.reattachRunningCore(using: liveProxyStore.clientFactory) else {
-            return false
-        }
-        liveProxyStore.activate(controller: reattached.client, trackedGroups: reattached.session.trackedGroups)
-        runningProfileSnapshot = reattached.session.runningProfile ?? profile
-        hasPendingHotReload = (profile != runningProfileSnapshot)
-        connectionMonitor.start(controller: reattached.client)
-        liveProxyStore.startPolling { [weak self] in self?.engine.isRunning ?? false }
-        showFeedback("已接管后台运行中的 Mihomo 核心")
-        return true
-    }
-
-    var shouldConfirmCoreOnQuit: Bool {
-        engine.isRunning || engine.isBusy
-    }
-
-    func prepareForQuit(stopCore: Bool) {
-        connectionMonitor.flushHistory()
-        if stopCore {
-            connectionMonitor.stop()
-            engine.terminateForAppExit()
-        } else {
-            connectionMonitor.stop()
-            engine.detachForAppExit()
-        }
-    }
-
-    private func scheduleAutoStartCoreIfNeeded() {
-        guard autoStartCoreOnLaunch else { return }
-        Task { @MainActor [weak self] in
-            // Wait briefly for initial binary/interface checks and allow NICs (e.g. USB/Wi-Fi) to come up after boot.
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            for _ in 0..<10 {
-                guard let self, self.autoStartCoreOnLaunch else { return }
-                if self.engine.isRunning || self.engine.isBusy { return }
-                self.refreshInterfaces()
-                self.refreshTunPermissionStatus()
-                if self.canStart {
-                    self.start()
-                    self.showFeedback("已自动启动 Mihomo 核心")
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-            }
-        }
-    }
-
-    func refreshTunPermissionStatus() {
-        tunPermissionStatus = TunHelperManager.status(for: binary)
-    }
-
-    func authorizeTun() {
-        guard !isAuthorizingTun, !engine.isBusy else { return }
-        isAuthorizingTun = true
-        let currentBinary = binary
-        let shouldRestart = engine.isRunning
-        Task { @MainActor in
-            var authorized = false
-            defer {
-                isAuthorizingTun = false
-                refreshTunPermissionStatus()
-                refreshKillSwitchStatus()
-                if authorized && shouldRestart && canStart {
-                    start()
-                    showFeedback("TUN 权限已重新授权，正在重启核心…")
-                }
-            }
-            if shouldRestart {
-                showFeedback("正在停止核心以重新授权 TUN 权限…")
-                connectionMonitor.stop()
-                engine.stop()
-                let deadline = Date().addingTimeInterval(10)
-                while (engine.isRunning || engine.isBusy) && Date() < deadline {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-                if engine.isRunning || engine.isBusy {
-                    alertText = "等待核心停止超时，请先手动停止核心后再重新授权。"
-                    return
-                }
-            }
-            do {
-                try await TunHelperManager.authorize(mihomoBinary: currentBinary)
-                authorized = true
-                if !shouldRestart {
-                    showFeedback("TUN 透明代理权限已授权")
-                }
-            } catch TunAuthorizationError.cancelled {
-                showFeedback(shouldRestart ? "已取消授权，核心已停止" : "已取消授权")
-            } catch {
-                alertText = error.localizedDescription
-            }
-        }
-    }
-
-    func revokeTunAuthorization() {
-        guard !isAuthorizingTun, !editingLocked else { return }
-        isAuthorizingTun = true
-        Task { @MainActor in
-            defer {
-                isAuthorizingTun = false
-                refreshTunPermissionStatus()
-                refreshKillSwitchStatus()
-            }
-            do {
-                try await TunHelperManager.revoke()
-                killSwitchActive = false
-                showFeedback("已撤销 TUN 权限授权并清理断网保护规则")
-            } catch TunAuthorizationError.cancelled {
-                showFeedback("已取消操作")
-            } catch {
-                alertText = error.localizedDescription
-            }
-        }
-    }
-
-    // MARK: - Kill Switch (PF Fail-Closed Protection)
-
-    func refreshKillSwitchStatus() {
-        Task { @MainActor [weak self] in
-            let status = await KillSwitchManager.queryStatusAsync()
-            guard let self else { return }
-            self.killSwitchActive = status.isActive
-            if status.isActive {
-                self.isRestoring = true
-                self.killSwitchAllowLAN = status.allowLAN
-                self.killSwitchPersistOnBoot = status.persistOnBoot
-                self.isRestoring = false
-            }
-        }
-    }
-
-    func setKillSwitchEnabled(_ enabled: Bool) {
-        guard !isUpdatingKillSwitch else { return }
-        if enabled && !tunPermissionStatus.isReady {
-            alertText = "开启断网保护前，请先在「TUN 透明代理模式」中完成管理员授权（若刚更新应用，请先点击「重新授权」）。"
-            return
-        }
-        isUpdatingKillSwitch = true
-        let allowLAN = killSwitchAllowLAN
-        let persistOnBoot = killSwitchPersistOnBoot
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.isUpdatingKillSwitch = false }
-            do {
-                let status = enabled
-                    ? try await KillSwitchManager.enableAsync(allowLAN: allowLAN, persistOnBoot: persistOnBoot)
-                    : try await KillSwitchManager.disableAsync()
-                self.killSwitchActive = status.isActive
-                if enabled {
-                    self.showFeedback("断网保护已开启：核心未启动或重启瞬间将自动阻断外网泄漏")
-                } else {
-                    self.showFeedback("断网保护已关闭，已恢复正常联网")
-                }
-            } catch {
-                self.refreshKillSwitchStatus()
-                self.alertText = error.localizedDescription
-            }
-        }
-    }
-
-    func setKillSwitchAllowLAN(_ allow: Bool) {
-        guard killSwitchAllowLAN != allow else { return }
-        killSwitchAllowLAN = allow
-        guard killSwitchActive, !isUpdatingKillSwitch else { return }
-        applyLiveKillSwitchOptions(feedbackMessage: allow ? "断网保护已更新：放行局域网私有网段（仍拦截局域网 53 端口 DNS 泄漏）" : "断网保护已更新：已禁止局域网直连通信")
-    }
-
-    func setKillSwitchPersistOnBoot(_ persist: Bool) {
-        guard killSwitchPersistOnBoot != persist else { return }
-        killSwitchPersistOnBoot = persist
-        guard killSwitchActive, !isUpdatingKillSwitch else { return }
-        applyLiveKillSwitchOptions(feedbackMessage: persist ? "断网保护已设为开机自动生效" : "已取消断网保护开机自动生效")
-    }
-
-    private func applyLiveKillSwitchOptions(feedbackMessage: String) {
-        isUpdatingKillSwitch = true
-        let allowLAN = killSwitchAllowLAN
-        let persistOnBoot = killSwitchPersistOnBoot
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.isUpdatingKillSwitch = false }
-            do {
-                let status = try await KillSwitchManager.enableAsync(allowLAN: allowLAN, persistOnBoot: persistOnBoot)
-                self.killSwitchActive = status.isActive
-                self.showFeedback(feedbackMessage)
-            } catch {
-                self.refreshKillSwitchStatus()
-                self.alertText = error.localizedDescription
-            }
-        }
-    }
-
-    func resetToBundledCore() {
-        guard !editingLocked else { return }
-        coreBinaryStore.resetToBundled { [weak self] in
-            self?.refreshTunPermissionStatus()
-            self?.showFeedback("已恢复内置内核")
-        }
-    }
-
-    func checkForCoreUpdate() {
-        let proxyPort = engine.isRunning ? activeMixedPort : nil
-        coreBinaryStore.checkForUpdate(proxyPort: proxyPort)
-    }
-
-    func installCoreUpdate() {
-        let proxyPort = engine.isRunning ? activeMixedPort : nil
-        coreBinaryStore.installUpdate(
-            proxyPort: proxyPort,
-            isEngineRunning: { [weak self] in self?.engine.isRunning ?? false },
-            onInstalled: { [weak self] installedVersion in
-                self?.refreshTunPermissionStatus()
-                self?.showFeedback("Mihomo 内核已更新至 \(installedVersion)")
-            }
-        )
-    }
-
-    func validate() {
-        guard let binary else { return }
-        engine.clearError()
-        do {
-            let rendered = try MihomoConfig.renderDetailed(
-                profile,
-                interfaceDNS: NetworkEnvironment.interfaceDNSServers(includeIPv6: profile.ipv6Enabled)
-            )
-            engine.validate(config: rendered.data, binary: binary)
-            showFeedback("已开始校验配置…")
-        } catch {
-            alertText = error.localizedDescription
-        }
-    }
-
-    func start() {
-        guard let binary else { return }
-        engine.clearError()
-        do {
-            let secret = UUID().uuidString + UUID().uuidString
-            let rendered = try MihomoConfig.renderDetailed(
-                profile,
-                controllerPort: controllerPort,
-                secret: secret,
-                interfaceDNS: NetworkEnvironment.interfaceDNSServers(includeIPv6: profile.ipv6Enabled)
-            )
-            let active = liveProxyStore.makeClient(
-                port: controllerPort,
-                secret: secret,
-                trackedGroups: rendered.activeProxyGroupNames
-            )
-            liveProxyStore.activate(controller: active, trackedGroups: rendered.activeProxyGroupNames)
-            runningProfileSnapshot = profile
-            hasPendingHotReload = false
-            let sessionContext = EngineSessionContext(
-                controllerPort: controllerPort,
-                secret: secret,
-                trackedGroups: rendered.activeProxyGroupNames,
-                runningProfile: profile
-            )
-            engine.start(
-                config: rendered.data,
-                binary: binary,
-                interfaces: rendered.requiredInterfaces,
-                useTun: rendered.tunEnabled,
-                useGateway: rendered.gatewayModeEnabled,
-                useSystemKeepAlive: systemKeepAliveEnabled,
-                preloadResources: rendered.preloadResources,
-                subscriptionCacheDirectory: activeProfileDirectory,
-                sessionContext: sessionContext
-            )
-            if !engine.isBusy && !engine.isRunning {
-                liveProxyStore.reset()
-                runningProfileSnapshot = nil
-            }
-        } catch {
-            alertText = error.localizedDescription
-        }
-    }
-
-    func hotReload() {
-        guard engine.isRunning, let active = liveProxyStore.controller, !isHotReloading else { return }
-        let snapshot = profile
-        let cacheDir = activeProfileDirectory
-        let rendered: RenderedMihomoConfig
-        do {
-            rendered = try MihomoConfig.renderDetailed(
-                snapshot,
-                controllerPort: active.port,
-                secret: active.secret,
-                interfaceDNS: NetworkEnvironment.interfaceDNSServers(includeIPv6: snapshot.ipv6Enabled)
-            )
-        } catch {
-            alertText = "热重载失败：\(error.localizedDescription)"
-            return
-        }
-
-        isHotReloading = true
-        showFeedback("正在热重载配置…")
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.isHotReloading = false }
-            await self.engine.prepareResourcesForHotReload(
-                rendered.preloadResources,
-                subscriptionCacheDirectory: cacheDir
-            )
-            guard self.engine.isRunning, self.liveProxyStore.controller?.sessionID == active.sessionID else { return }
-            do {
-                try await active.reloadConfig(payload: rendered.data)
-                let updatedController = self.liveProxyStore.makeClient(
-                    port: active.port,
-                    secret: active.secret,
-                    trackedGroups: rendered.activeProxyGroupNames
-                )
-                self.liveProxyStore.replaceController(updatedController, trackedGroups: rendered.activeProxyGroupNames)
-                self.runningProfileSnapshot = snapshot
-                self.hasPendingHotReload = (self.profile != snapshot)
-                self.engine.persistHotReloadedConfig(rendered.data)
-                self.engine.updateRuntimeSession(
-                    trackedGroups: rendered.activeProxyGroupNames,
-                    runningProfile: snapshot
-                )
-                try? await self.liveProxyStore.reloadGroups(updatedController) { [weak self] in self?.engine.isRunning ?? false }
-                self.liveProxyStore.startPolling { [weak self] in self?.engine.isRunning ?? false }
-                self.showFeedback("配置已热重载生效")
-            } catch {
-                self.alertText = "热重载失败：\(error.localizedDescription)"
-            }
-        }
-    }
-
-    func stop() {
-        engine.stop()
-    }
-
     // MARK: - Clipboard Helpers
 
     func copyText(_ text: String, label: String) {
@@ -950,12 +764,14 @@ final class AppState: ObservableObject {
     }
 
     func copyProxyAddress() {
-        copyText(localProxyAddress, label: "本机代理地址 \(localProxyAddress)")
+        let label = isViewingRemote ? "远程代理地址 \(localProxyAddress)" : "本机代理地址 \(localProxyAddress)"
+        copyText(localProxyAddress, label: label)
     }
 
     func copyShellExport() {
-        let http = "http://127.0.0.1:\(profile.httpPort ?? profile.mixedPort)"
-        let socks = "socks5://127.0.0.1:\(profile.socksPort ?? profile.mixedPort)"
+        let host = activeRemoteHost?.host ?? "127.0.0.1"
+        let http = "http://\(host):\(profile.httpPort ?? profile.mixedPort)"
+        let socks = "socks5://\(host):\(profile.socksPort ?? profile.mixedPort)"
         let cmd = "export https_proxy=\(http) http_proxy=\(http) all_proxy=\(socks)"
         copyText(cmd, label: "终端代理命令")
     }
@@ -972,133 +788,7 @@ final class AppState: ObservableObject {
         copyText(lines.joined(separator: "\n"), label: "局域网网关配置（\(ip)）")
     }
 
-    // MARK: - Live Proxy Groups
-
-    func refreshGroups() {
-        liveProxyStore.refreshGroups(
-            isEngineRunning: { [weak self] in self?.engine.isRunning ?? false },
-            onFeedback: { [weak self] in self?.showFeedback($0) },
-            onError: { [weak self] in self?.alertText = $0 }
-        )
-    }
-
-    func selectNode(group: String, node: String) {
-        liveProxyStore.selectNode(
-            group: group,
-            node: node,
-            isEngineRunning: { [weak self] in self?.engine.isRunning ?? false },
-            onFeedback: { [weak self] in self?.showFeedback($0) },
-            onError: { [weak self] in self?.alertText = $0 }
-        )
-    }
-
-    func testGroupDelay(group: String) {
-        liveProxyStore.testGroupDelay(
-            group: group,
-            isEngineRunning: { [weak self] in self?.engine.isRunning ?? false },
-            onFeedback: { [weak self] in self?.showFeedback($0) }
-        )
-    }
-
-    func updateOnlineRuleProviders() {
-        liveProxyStore.updateOnlineRuleProviders(
-            isEngineRunning: { [weak self] in self?.engine.isRunning ?? false },
-            onFeedback: { [weak self] in self?.showFeedback($0) },
-            onError: { [weak self] in self?.alertText = $0 }
-        )
-    }
-
-    func updateGeoResources() {
-        guard !updatingGeoResources else { return }
-        updatingGeoResources = true
-        geoUpdateMessage = "正在安全下载并校验 Geo 数据库…"
-        let proxyPort = engine.isRunning ? activeMixedPort : nil
-        let workDir = engine.mihomoWorkDirectory
-
-        Task { @MainActor in
-            defer { updatingGeoResources = false }
-            let results = await GeoResourceUpdater.updateAll(in: workDir, proxyPort: proxyPort)
-            guard !results.isEmpty else {
-                geoUpdateMessage = "未找到内置资源清单，请先通过构建脚本打包。"
-                return
-            }
-            let updatedCount = results.filter { $0.outcome == .updated }.count
-            let keptCount = results.filter {
-                if case .keptExistingAfterFailure = $0.outcome { return true }
-                return false
-            }.count
-            let restoredCount = results.filter {
-                if case .restoredBundledAfterFailure = $0.outcome { return true }
-                return false
-            }.count
-
-            if updatedCount == results.count {
-                let suffix = engine.isRunning ? "（重启核心后生效）" : ""
-                geoUpdateMessage = "已安全更新 \(updatedCount) 项 Geo 数据库\(suffix)。"
-                showFeedback("Geo 数据库已更新")
-            } else if updatedCount > 0 {
-                geoUpdateMessage = "已更新 \(updatedCount) 项，其余 \(keptCount + restoredCount) 项失败并保留原有可用版本。"
-            } else if keptCount > 0 || restoredCount > 0 {
-                geoUpdateMessage = "更新失败，已保留原有可用缓存（未覆盖）。"
-            } else {
-                geoUpdateMessage = "Geo 数据库更新失败，请检查网络或代理设置。"
-            }
-        }
-    }
-
-    func closeMonitoredConnection(id: String) {
-        guard engine.isRunning else { return }
-        Task { @MainActor in
-            do {
-                try await connectionMonitor.closeConnection(id: id)
-                showFeedback("已断开连接")
-            } catch {
-                alertText = error.localizedDescription
-            }
-        }
-    }
-
-    func closeAllMonitoredConnections() {
-        guard engine.isRunning else { return }
-        Task { @MainActor in
-            do {
-                try await connectionMonitor.closeAllConnections()
-                showFeedback("已断开全部活跃连接")
-            } catch {
-                alertText = error.localizedDescription
-            }
-        }
-    }
-
-    func flushDNSCache(includeFakeIP: Bool = false) {
-        guard engine.isRunning else { return }
-        Task { @MainActor in
-            do {
-                try await connectionMonitor.flushDNSCache(includeFakeIP: includeFakeIP)
-                showFeedback(includeFakeIP ? "已清空内核 DNS 与 Fake-IP 缓存" : "已清空内核 DNS 缓存")
-            } catch {
-                alertText = "清空 DNS 缓存失败：\(error.localizedDescription)"
-            }
-        }
-    }
-
-    func clearDNSLogsAndCache(includeFakeIP: Bool = false) {
-        connectionMonitor.clearDNSLogs()
-        guard engine.isRunning else {
-            showFeedback("已清空 DNS 解析日志")
-            return
-        }
-        Task { @MainActor in
-            do {
-                try await connectionMonitor.flushDNSCache(includeFakeIP: includeFakeIP)
-                showFeedback(includeFakeIP ? "已清空 DNS 日志、DNS 缓存与 Fake-IP 缓存" : "已清空 DNS 日志与内核 DNS 缓存")
-            } catch {
-                alertText = "日志已清空，但清空内核 DNS 缓存失败：\(error.localizedDescription)"
-            }
-        }
-    }
-
-    // MARK: - Profile Import / Export
+    // MARK: - Profile Import / Export & Directory Picker
 
     func importProfile() {
         let panel = NSOpenPanel()
@@ -1169,8 +859,8 @@ final class AppState: ObservableObject {
             case .alertFirstButtonReturn:
                 do {
                     let loaded = try ProfileStore.readProfile(from: targetDir)
-                    applyProfileDirectory(targetDir)
-                    applyProfileWithoutAutosave(loaded)
+                    localSession.applyProfileDirectory(targetDir)
+                    localSession.applyLoadedProfileWithoutAutosave(loaded)
                     subscriptionStore.loadCache(in: targetDir)
                     showFeedback("已切换配置目录并加载已有配置")
                 } catch {
@@ -1193,8 +883,8 @@ final class AppState: ObservableObject {
         do {
             try ProfileStore.writeProfile(profile, to: defaultDir, enforcePrivateDirectoryPermissions: true)
             subscriptionStore.migrateCache(urls: profile.subscriptions.map(\.url), from: oldDir, to: defaultDir)
-            autoSaveTask?.cancel()
-            customProfileDirectory = nil
+            localSession.cancelAutoSave()
+            localSession.applyProfileDirectory(nil)
             showFeedback("已恢复默认配置目录并保存当前配置")
         } catch {
             alertText = "无法写入默认配置目录：\(error.localizedDescription)"
@@ -1203,14 +893,14 @@ final class AppState: ObservableObject {
 
     func reloadProfileFromDisk() {
         guard !editingLocked else { return }
-        autoSaveTask?.cancel()
+        localSession.cancelAutoSave()
         guard ProfileStore.profileExists(in: activeProfileDirectory) else {
             alertText = "当前配置目录中尚无 \(ProfileStore.fileName)。"
             return
         }
         do {
             let loaded = try ProfileStore.readProfile(from: activeProfileDirectory)
-            applyProfileWithoutAutosave(loaded)
+            localSession.applyLoadedProfileWithoutAutosave(loaded)
             showFeedback("已从配置目录重新加载")
         } catch {
             alertText = "无法读取配置：\(error.localizedDescription)"
@@ -1232,29 +922,12 @@ final class AppState: ObservableObject {
         do {
             try ProfileStore.writeProfile(profile, to: directory, enforcePrivateDirectoryPermissions: isDefault)
             subscriptionStore.migrateCache(urls: profile.subscriptions.map(\.url), from: oldDir, to: directory)
-            autoSaveTask?.cancel()
-            applyProfileDirectory(isDefault ? nil : directory)
+            localSession.cancelAutoSave()
+            localSession.applyProfileDirectory(isDefault ? nil : directory)
             showFeedback("已切换配置目录并保存当前配置")
         } catch {
             alertText = "无法写入所选配置目录：\(error.localizedDescription)"
         }
-    }
-
-    private func applyProfileDirectory(_ directory: URL?) {
-        let defaultDir = ProfileStore().defaultDirectory
-        if let directory, directory.standardizedFileURL != defaultDir.standardizedFileURL {
-            customProfileDirectory = directory.standardizedFileURL
-        } else {
-            customProfileDirectory = nil
-        }
-        connectionMonitor.configureHistory(directory: activeProfileDirectory)
-    }
-
-    private func applyProfileWithoutAutosave(_ newProfile: RoutingProfile) {
-        autoSaveTask?.cancel()
-        isRestoring = true
-        profile = newProfile
-        isRestoring = false
     }
 
     func exportConfig() {
@@ -1291,73 +964,6 @@ final class AppState: ObservableObject {
             guard !Task.isCancelled, let self else { return }
             if self.feedback == message {
                 self.feedback = ""
-            }
-        }
-    }
-
-    // MARK: - Internal State Management
-
-    private func restoreState() {
-        isRestoring = true
-        defer { isRestoring = false }
-
-        let defaults = UserDefaults.standard
-        let savedPort = defaults.integer(forKey: DefaultsKey.controllerPort)
-        if (1024...65535).contains(savedPort) {
-            controllerPort = savedPort
-        }
-        if let profileDirPath = defaults.string(forKey: DefaultsKey.profileDirectoryPath),
-           !profileDirPath.isEmpty {
-            applyProfileDirectory(URL(fileURLWithPath: profileDirPath, isDirectory: true))
-        }
-        autoStartCoreOnLaunch = defaults.bool(forKey: DefaultsKey.autoStartCoreOnLaunch)
-        if defaults.object(forKey: DefaultsKey.systemKeepAliveEnabled) != nil {
-            systemKeepAliveEnabled = defaults.bool(forKey: DefaultsKey.systemKeepAliveEnabled)
-        } else {
-            systemKeepAliveEnabled = true
-        }
-        if defaults.object(forKey: DefaultsKey.killSwitchAllowLAN) != nil {
-            killSwitchAllowLAN = defaults.bool(forKey: DefaultsKey.killSwitchAllowLAN)
-        } else {
-            killSwitchAllowLAN = true
-        }
-        killSwitchPersistOnBoot = defaults.bool(forKey: DefaultsKey.killSwitchPersistOnBoot)
-
-        if ProfileStore.profileExists(in: activeProfileDirectory),
-           let decoded = try? ProfileStore.readProfile(from: activeProfileDirectory) {
-            profile = decoded
-        }
-    }
-
-    private func saveSettings() {
-        guard !isRestoring else { return }
-        let defaults = UserDefaults.standard
-        defaults.set(controllerPort, forKey: DefaultsKey.controllerPort)
-        if let customProfileDirectory, isUsingCustomProfileDirectory {
-            defaults.set(customProfileDirectory.path, forKey: DefaultsKey.profileDirectoryPath)
-        } else {
-            defaults.removeObject(forKey: DefaultsKey.profileDirectoryPath)
-        }
-        defaults.set(autoStartCoreOnLaunch, forKey: DefaultsKey.autoStartCoreOnLaunch)
-        defaults.set(systemKeepAliveEnabled, forKey: DefaultsKey.systemKeepAliveEnabled)
-        defaults.set(killSwitchAllowLAN, forKey: DefaultsKey.killSwitchAllowLAN)
-        defaults.set(killSwitchPersistOnBoot, forKey: DefaultsKey.killSwitchPersistOnBoot)
-    }
-
-    private func scheduleAutoSave() {
-        guard !isRestoring else { return }
-        autoSaveTask?.cancel()
-        let snapshot = profile
-        let targetDir = activeProfileDirectory
-        let isDefault = !isUsingCustomProfileDirectory
-        autoSaveTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            guard !Task.isCancelled, let self else { return }
-            _ = self
-            do {
-                try ProfileStore.writeProfile(snapshot, to: targetDir, enforcePrivateDirectoryPermissions: isDefault)
-            } catch {
-                // Silent failure for background autosave.
             }
         }
     }
