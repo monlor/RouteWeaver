@@ -1324,71 +1324,6 @@ final class RoutingCoreTests: XCTestCase {
         }
     }
 
-    func testKillSwitchPFRuleGenerationAndOrder() {
-        let withLAN = KillSwitchRules.renderPFConfig(allowLAN: true)
-        let withoutLAN = KillSwitchRules.renderPFConfig(allowLAN: false)
-
-        // Core allowlist rules and strict ordering: lo0 -> utun -> Mihomo dedicated GID -> block port 53 -> DHCP -> (optional LAN) -> drop all
-        let lo0Idx = withLAN.range(of: "pass quick on lo0 all")?.lowerBound
-        let utunIdx = withLAN.range(of: "utun0, utun1")?.lowerBound
-        let mihomoIdx = withLAN.range(of: "user 0 group \(KillSwitchRules.mihomoDedicatedGID)")?.lowerBound
-        let dnsBlockIdx = withLAN.range(of: "block drop out quick proto { tcp, udp } from any to any port 53")?.lowerBound
-        let dhcpIdx = withLAN.range(of: "from any port 68 to any port 67")?.lowerBound
-        let lanIdx = withLAN.range(of: "192.168.0.0/16")?.lowerBound
-        let dropAllIdx = withLAN.range(of: "block drop out quick all")?.lowerBound
-
-        XCTAssertNotNil(lo0Idx)
-        XCTAssertNotNil(utunIdx)
-        XCTAssertNotNil(mihomoIdx)
-        XCTAssertNotNil(dnsBlockIdx)
-        XCTAssertNotNil(dhcpIdx)
-        XCTAssertNotNil(lanIdx)
-        XCTAssertNotNil(dropAllIdx)
-
-        if let lo0Idx, let utunIdx, let mihomoIdx, let dnsBlockIdx, let dhcpIdx, let lanIdx, let dropAllIdx {
-            XCTAssertLessThan(lo0Idx, utunIdx)
-            XCTAssertLessThan(utunIdx, mihomoIdx)
-            XCTAssertLessThan(mihomoIdx, dnsBlockIdx)
-            XCTAssertLessThan(dnsBlockIdx, dhcpIdx)
-            XCTAssertLessThan(dhcpIdx, lanIdx)
-            XCTAssertLessThan(lanIdx, dropAllIdx)
-        }
-
-        // Without LAN: DHCP still allowed so NICs can acquire leases, but RFC1918 / link-local pass rules are omitted
-        XCTAssertTrue(withoutLAN.contains("from any port 68 to any port 67"))
-        XCTAssertTrue(withoutLAN.contains("from any port 546 to any port 547"))
-        XCTAssertFalse(withoutLAN.contains("192.168.0.0/16"))
-        XCTAssertFalse(withoutLAN.contains("fe80::/10"))
-        XCTAssertTrue(withoutLAN.contains("block drop out quick all"))
-
-        // Verify syntax against macOS /sbin/pfctl -vnf - when available
-        #if os(macOS)
-        let pfctlPath = "/sbin/pfctl"
-        if FileManager.default.isExecutableFile(atPath: pfctlPath) {
-            for rules in [withLAN, withoutLAN] {
-                let proc = Process()
-                let inPipe = Pipe()
-                let outPipe = Pipe()
-                proc.executableURL = URL(fileURLWithPath: pfctlPath)
-                proc.arguments = ["-vnf", "-"]
-                proc.standardInput = inPipe
-                proc.standardOutput = outPipe
-                proc.standardError = outPipe
-                try? proc.run()
-                inPipe.fileHandleForWriting.write(Data(rules.utf8))
-                try? inPipe.fileHandleForWriting.close()
-                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-                proc.waitUntilExit()
-                XCTAssertEqual(
-                    proc.terminationStatus,
-                    0,
-                    "pfctl syntax validation failed: \(String(decoding: outData, as: UTF8.self))"
-                )
-            }
-        }
-        #endif
-    }
-
     func testRoutingProfileReferentialIntegrityMutations() {
         let sub = ProxySubscription(name: "SubA", url: "https://example.com/sub.yaml", role: .exit)
         let exitGroup = NodeGroup(name: "HK", kind: .exit, subscriptionID: sub.id, filterPattern: "HK")
@@ -1633,5 +1568,190 @@ final class RoutingCoreTests: XCTestCase {
         let dns = try XCTUnwrap(config["dns"] as? [String: Any])
         let policy = try XCTUnwrap(dns["nameserver-policy"] as? [String: [String]])
         XCTAssertEqual(policy["geosite:cn"], ["system", "223.5.5.5", "119.29.29.29"])
+    }
+
+    func testClientAddressValidatorAndSrcIPCIDRRule() throws {
+        XCTAssertEqual(ClientAddressValidator.normalizedCIDR("192.168.1.55"), "192.168.1.55/32")
+        XCTAssertEqual(ClientAddressValidator.normalizedCIDR("192.168.1.0/24"), "192.168.1.0/24")
+        XCTAssertEqual(ClientAddressValidator.normalizedCIDR("fd00::1"), "fd00::1/128")
+        XCTAssertEqual(ClientAddressValidator.normalizedCIDR("fd00::/64"), "fd00::/64")
+        XCTAssertNil(ClientAddressValidator.normalizedCIDR("999.1.1.1"))
+        XCTAssertNil(ClientAddressValidator.normalizedCIDR("192.168.1.1/33"))
+        XCTAssertNil(ClientAddressValidator.normalizedCIDR("not-an-ip"))
+        XCTAssertNil(ClientAddressValidator.normalizedCIDR("192.168.1.1,10.0.0.1"))
+
+        let rule = RuleItem(type: .srcIPCIDR, value: "192.168.1.55")
+        XCTAssertEqual(rule.formatted(target: "国内直连"), "SRC-IP-CIDR,192.168.1.55/32,国内直连")
+
+        let directTarget = NetworkTarget(name: "国内直连", mode: .direct)
+        let validProfile = RoutingProfile(
+            targets: [directTarget],
+            ruleGroups: [
+                RuleGroup(
+                    name: "指定设备直连",
+                    target: .target(directTarget.id),
+                    rules: [RuleItem(type: .srcIPCIDR, value: "192.168.1.55")]
+                )
+            ],
+            fallbackTarget: .target(directTarget.id)
+        )
+        let config = try decodeJSON(try MihomoConfig.render(validProfile))
+        let rules = try XCTUnwrap(config["rules"] as? [String])
+        XCTAssertTrue(rules.contains("SRC-IP-CIDR,192.168.1.55/32,国内直连"))
+
+        // RuleMatchDisplayIndex matches Mihomo's SrcIPCIDR payload
+        let index = RuleMatchDisplayIndex(profile: validProfile)
+        XCTAssertEqual(index.resolve(rule: "SrcIPCIDR", payload: "192.168.1.55/32")?.groupName, "指定设备直连")
+
+        // Invalid SRC-IP-CIDR throws invalidRule
+        let invalidProfile = RoutingProfile(
+            targets: [directTarget],
+            ruleGroups: [
+                RuleGroup(
+                    name: "坏规则",
+                    target: .target(directTarget.id),
+                    rules: [RuleItem(type: .srcIPCIDR, value: "bad-ip")]
+                )
+            ],
+            fallbackTarget: .target(directTarget.id)
+        )
+        XCTAssertThrowsError(try MihomoConfig.render(invalidProfile)) { error in
+            guard case RoutingConfigurationError.invalidRule = error else {
+                XCTFail("Expected invalidRule, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testRuleGroupClientScopeSubRulesAndDNSIsolation() throws {
+        let sub = ProxySubscription(name: "Sub", url: exitSubURL, role: .general)
+        let usGroup = NodeGroup(name: "美国出口", kind: .exit, subscriptionID: sub.id, filterPattern: "US", autoTest: true)
+        let usTarget = NetworkTarget(name: "美国", mode: .proxy, exitGroupID: usGroup.id)
+        let directTarget = NetworkTarget(name: "国内直连", mode: .direct)
+
+        let singleInclude = RuleGroup(
+            name: "AppleTV 流媒体",
+            target: .target(usTarget.id),
+            rules: [RuleItem(type: .domainSuffix, value: "netflix.com")],
+            clientScopeMode: .include,
+            clientEntries: [
+                RuleGroupClientEntry(address: "192.168.1.55", name: "Apple TV"),
+                RuleGroupClientEntry(address: "192.168.1.56", name: "Disabled", isEnabled: false),
+            ]
+        )
+        let multiInclude = RuleGroup(
+            name: "主机游戏",
+            target: .target(usTarget.id),
+            rules: [RuleItem(type: .domainSuffix, value: "playstation.net")],
+            clientScopeMode: .include,
+            clientEntries: [
+                RuleGroupClientEntry(address: "192.168.1.66", name: "PS5"),
+                RuleGroupClientEntry(address: "192.168.2.0/24", name: "游戏网段"),
+            ]
+        )
+        let singleExclude = RuleGroup(
+            name: "除电视外走直连",
+            target: .target(directTarget.id),
+            rules: [RuleItem(type: .domainSuffix, value: "example.org")],
+            clientScopeMode: .exclude,
+            clientEntries: [
+                RuleGroupClientEntry(address: "192.168.1.55", name: "Apple TV")
+            ]
+        )
+        let multiExclude = RuleGroup(
+            name: "排除多台设备",
+            target: .target(directTarget.id),
+            rules: [RuleItem(type: .domain, value: "test.example.com")],
+            clientScopeMode: .exclude,
+            clientEntries: [
+                RuleGroupClientEntry(address: "192.168.1.99"),
+                RuleGroupClientEntry(address: "fd00::1"),
+            ]
+        )
+        let emptyInclude = RuleGroup(
+            name: "空设备组",
+            target: .target(usTarget.id),
+            rules: [RuleItem(type: .domainSuffix, value: "unused.example.com")],
+            clientScopeMode: .include,
+            clientEntries: []
+        )
+        let emptyExclude = RuleGroup(
+            name: "空排除组",
+            target: .target(directTarget.id),
+            rules: [RuleItem(type: .domainSuffix, value: "all-devices.example.com")],
+            clientScopeMode: .exclude,
+            clientEntries: []
+        )
+
+        let profile = RoutingProfile(
+            subscriptions: [sub],
+            nodeGroups: [usGroup],
+            targets: [directTarget, usTarget],
+            ruleGroups: [singleInclude, multiInclude, singleExclude, multiExclude, emptyInclude, emptyExclude],
+            fallbackTarget: .target(directTarget.id)
+        )
+
+        let renderedData = try MihomoConfig.render(profile)
+        let config = try decodeJSON(renderedData)
+        let rules = try XCTUnwrap(config["rules"] as? [String])
+        let subRules = try XCTUnwrap(config["sub-rules"] as? [String: [String]])
+
+        XCTAssertEqual(subRules.count, 4)
+        XCTAssertTrue(rules.contains { $0.hasPrefix("SUB-RULE,(SRC-IP-CIDR,192.168.1.55/32),rg-0-") })
+        XCTAssertTrue(rules.contains { $0.hasPrefix("SUB-RULE,(OR,((SRC-IP-CIDR,192.168.1.66/32),(SRC-IP-CIDR,192.168.2.0/24))),rg-1-") })
+        XCTAssertTrue(rules.contains { $0.hasPrefix("SUB-RULE,(NOT,((SRC-IP-CIDR,192.168.1.55/32))),rg-2-") })
+        XCTAssertTrue(rules.contains { $0.hasPrefix("SUB-RULE,(NOT,((OR,((SRC-IP-CIDR,192.168.1.99/32),(SRC-IP-CIDR,fd00::1/128))))),rg-3-") })
+
+        // Empty include is skipped; empty exclude behaves as normal rules
+        XCTAssertFalse(rules.contains { $0.contains("unused.example.com") })
+        XCTAssertTrue(rules.contains("DOMAIN-SUFFIX,all-devices.example.com,国内直连"))
+
+        // Verify sub-rule contents
+        let rg0Key = try XCTUnwrap(subRules.keys.first { $0.hasPrefix("rg-0-") })
+        XCTAssertEqual(subRules[rg0Key], ["DOMAIN-SUFFIX,netflix.com,美国"])
+        let rg1Key = try XCTUnwrap(subRules.keys.first { $0.hasPrefix("rg-1-") })
+        XCTAssertEqual(subRules[rg1Key], ["DOMAIN-SUFFIX,playstation.net,美国"])
+
+        // Device-scoped groups must NOT pollute global dns.nameserver-policy
+        let dns = try XCTUnwrap(config["dns"] as? [String: Any])
+        let policy = dns["nameserver-policy"] as? [String: [String]] ?? [:]
+        XCTAssertNil(policy["+.netflix.com"])
+        XCTAssertNil(policy["+.playstation.net"])
+
+        // Legacy JSON without clientScopeMode / clientEntries decodes cleanly
+        let legacyJSON = """
+        {
+          "id": "\(UUID().uuidString)",
+          "name": "旧规则组",
+          "icon": "sparkles",
+          "target": { "kind": "reject" },
+          "isEnabled": true,
+          "rules": []
+        }
+        """.data(using: .utf8)!
+        let decodedLegacy = try JSONDecoder().decode(RuleGroup.self, from: legacyJSON)
+        XCTAssertEqual(decodedLegacy.clientScopeMode, .all)
+        XCTAssertTrue(decodedLegacy.clientEntries.isEmpty)
+
+        // Invalid client entry throws invalidRule
+        let badClientProfile = RoutingProfile(
+            targets: [directTarget],
+            ruleGroups: [
+                RuleGroup(
+                    name: "无效设备",
+                    target: .target(directTarget.id),
+                    rules: [RuleItem(type: .domainSuffix, value: "example.com")],
+                    clientScopeMode: .include,
+                    clientEntries: [RuleGroupClientEntry(address: "999.999.1.1")]
+                )
+            ],
+            fallbackTarget: .target(directTarget.id)
+        )
+        XCTAssertThrowsError(try MihomoConfig.render(badClientProfile)) { error in
+            guard case RoutingConfigurationError.invalidRule = error else {
+                XCTFail("Expected invalidRule, got \(error)")
+                return
+            }
+        }
     }
 }

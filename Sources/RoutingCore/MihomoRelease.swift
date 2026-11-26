@@ -4,11 +4,34 @@ public struct MihomoReleaseAsset: Equatable, Sendable {
     public let name: String
     public let downloadURL: URL
     public let size: Int64
+    public let sha256: String?
 
-    public init(name: String, downloadURL: URL, size: Int64) {
+    public init(name: String, downloadURL: URL, size: Int64, sha256: String? = nil) {
         self.name = name
         self.downloadURL = downloadURL
         self.size = size
+        self.sha256 = Self.normalizeSHA256(sha256)
+    }
+
+    /// Parses GitHub release asset `digest` (e.g. `"sha256:0123abcd..."`) or raw 64-char hex string.
+    public static func parseGitHubDigest(_ digest: String?) -> String? {
+        guard let raw = digest?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        let lower = raw.lowercased()
+        let hex = lower.hasPrefix("sha256:") ? String(lower.dropFirst("sha256:".count)) : lower
+        return normalizeSHA256(hex)
+    }
+
+    private static func normalizeSHA256(_ candidate: String?) -> String? {
+        guard let candidate = candidate?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              candidate.count == 64,
+              candidate.unicodeScalars.allSatisfy({
+                  ("0"..."9").contains($0) || ("a"..."f").contains($0)
+              }) else {
+            return nil
+        }
+        return candidate
     }
 }
 

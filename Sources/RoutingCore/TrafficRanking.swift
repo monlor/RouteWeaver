@@ -4,6 +4,7 @@ public enum TrafficRankingDimension: String, CaseIterable, Identifiable, Sendabl
     case domain
     case ip
     case process
+    case client
 
     public var id: String { rawValue }
 
@@ -12,6 +13,7 @@ public enum TrafficRankingDimension: String, CaseIterable, Identifiable, Sendabl
         case .domain: return "域名"
         case .ip: return "IP"
         case .process: return "进程"
+        case .client: return "来源设备"
         }
     }
 
@@ -20,6 +22,7 @@ public enum TrafficRankingDimension: String, CaseIterable, Identifiable, Sendabl
         case .domain: return "globe"
         case .ip: return "network"
         case .process: return "app.dashed"
+        case .client: return "laptopcomputer.and.iphone"
         }
     }
 
@@ -28,6 +31,7 @@ public enum TrafficRankingDimension: String, CaseIterable, Identifiable, Sendabl
         case .domain: return "域名"
         case .ip: return "目标 IP"
         case .process: return "进程"
+        case .client: return "来源设备"
         }
     }
 }
@@ -124,31 +128,41 @@ public struct TrafficDimensionDeltas: Equatable, Sendable {
     public var domains: [String: TrafficBytes] = [:]
     public var ips: [String: TrafficBytes] = [:]
     public var processes: [String: TrafficBytes] = [:]
+    public var clients: [String: TrafficBytes] = [:]
     public var processDomains: [String: [String: TrafficBytes]] = [:]
     public var processIPs: [String: [String: TrafficBytes]] = [:]
+    public var clientDomains: [String: [String: TrafficBytes]] = [:]
+    public var clientIPs: [String: [String: TrafficBytes]] = [:]
 
     public var isEmpty: Bool {
-        domains.isEmpty && ips.isEmpty && processes.isEmpty
+        domains.isEmpty && ips.isEmpty && processes.isEmpty && clients.isEmpty
     }
 
     public init(
         domains: [String: TrafficBytes] = [:],
         ips: [String: TrafficBytes] = [:],
         processes: [String: TrafficBytes] = [:],
+        clients: [String: TrafficBytes] = [:],
         processDomains: [String: [String: TrafficBytes]] = [:],
-        processIPs: [String: [String: TrafficBytes]] = [:]
+        processIPs: [String: [String: TrafficBytes]] = [:],
+        clientDomains: [String: [String: TrafficBytes]] = [:],
+        clientIPs: [String: [String: TrafficBytes]] = [:]
     ) {
         self.domains = domains
         self.ips = ips
         self.processes = processes
+        self.clients = clients
         self.processDomains = processDomains
         self.processIPs = processIPs
+        self.clientDomains = clientDomains
+        self.clientIPs = clientIPs
     }
 
     public mutating func add(
         domain: String,
         ip: String,
         process: String,
+        client: String = TrafficAttribution.unknownLabel,
         upload: Int64,
         download: Int64
     ) {
@@ -168,6 +182,10 @@ public struct TrafficDimensionDeltas: Equatable, Sendable {
         processEntry.add(upload: up, download: down)
         processes[process] = processEntry
 
+        var clientEntry = clients[client] ?? .zero
+        clientEntry.add(upload: up, download: down)
+        clients[client] = clientEntry
+
         var procDomainMap = processDomains[process] ?? [:]
         var procDomainEntry = procDomainMap[domain] ?? .zero
         procDomainEntry.add(upload: up, download: down)
@@ -179,19 +197,53 @@ public struct TrafficDimensionDeltas: Equatable, Sendable {
         procIPEntry.add(upload: up, download: down)
         procIPMap[ip] = procIPEntry
         processIPs[process] = procIPMap
+
+        var clientDomainMap = clientDomains[client] ?? [:]
+        var clientDomainEntry = clientDomainMap[domain] ?? .zero
+        clientDomainEntry.add(upload: up, download: down)
+        clientDomainMap[domain] = clientDomainEntry
+        clientDomains[client] = clientDomainMap
+
+        var clientIPMap = clientIPs[client] ?? [:]
+        var clientIPEntry = clientIPMap[ip] ?? .zero
+        clientIPEntry.add(upload: up, download: down)
+        clientIPMap[ip] = clientIPEntry
+        clientIPs[client] = clientIPMap
     }
 }
 
 public enum TrafficAttribution {
     public static let unknownLabel = "未知"
     public static let otherLabel = "其他"
+    public static let localDeviceLabel = "本机"
 
-    public static func extract(from metadata: MihomoConnectionMetadata) -> (domain: String, ip: String, process: String) {
+    public static func extract(
+        from metadata: MihomoConnectionMetadata,
+        localIPs: Set<String> = []
+    ) -> (domain: String, ip: String, process: String, client: String) {
         (
             domain: extractDomain(from: metadata),
             ip: extractIP(from: metadata),
-            process: extractProcess(from: metadata)
+            process: extractProcess(from: metadata),
+            client: extractClient(from: metadata, localIPs: localIPs)
         )
+    }
+
+    public static func extractClient(
+        from metadata: MihomoConnectionMetadata,
+        localIPs: Set<String> = []
+    ) -> String {
+        let source = normalizeIPCandidate(metadata.sourceIP)
+        if source.isEmpty
+            || source == "127.0.0.1"
+            || source == "::1"
+            || source == "0.0.0.0"
+            || source == "::"
+            || source.hasPrefix("198.18.")
+            || localIPs.contains(source) {
+            return localDeviceLabel
+        }
+        return source
     }
 
     /// Extracts observed hostname without performing any reverse DNS lookup.
@@ -247,25 +299,34 @@ public struct TrafficDimensionBuckets: Codable, Equatable, Sendable {
     public var domains: [String: TrafficBytes]
     public var ips: [String: TrafficBytes]
     public var processes: [String: TrafficBytes]
+    public var clients: [String: TrafficBytes]
     public var processDomains: [String: [String: TrafficBytes]]
     public var processIPs: [String: [String: TrafficBytes]]
+    public var clientDomains: [String: [String: TrafficBytes]]
+    public var clientIPs: [String: [String: TrafficBytes]]
 
     public init(
         domains: [String: TrafficBytes] = [:],
         ips: [String: TrafficBytes] = [:],
         processes: [String: TrafficBytes] = [:],
+        clients: [String: TrafficBytes] = [:],
         processDomains: [String: [String: TrafficBytes]] = [:],
-        processIPs: [String: [String: TrafficBytes]] = [:]
+        processIPs: [String: [String: TrafficBytes]] = [:],
+        clientDomains: [String: [String: TrafficBytes]] = [:],
+        clientIPs: [String: [String: TrafficBytes]] = [:]
     ) {
         self.domains = domains
         self.ips = ips
         self.processes = processes
+        self.clients = clients
         self.processDomains = processDomains
         self.processIPs = processIPs
+        self.clientDomains = clientDomains
+        self.clientIPs = clientIPs
     }
 
     private enum CodingKeys: String, CodingKey {
-        case domains, ips, processes, processDomains, processIPs
+        case domains, ips, processes, clients, processDomains, processIPs, clientDomains, clientIPs
     }
 
     public init(from decoder: Decoder) throws {
@@ -273,11 +334,31 @@ public struct TrafficDimensionBuckets: Codable, Equatable, Sendable {
         domains = try c.decodeIfPresent([String: TrafficBytes].self, forKey: .domains) ?? [:]
         ips = try c.decodeIfPresent([String: TrafficBytes].self, forKey: .ips) ?? [:]
         processes = try c.decodeIfPresent([String: TrafficBytes].self, forKey: .processes) ?? [:]
+        clients = try c.decodeIfPresent([String: TrafficBytes].self, forKey: .clients) ?? [:]
         processDomains = try c.decodeIfPresent([String: [String: TrafficBytes]].self, forKey: .processDomains) ?? [:]
         processIPs = try c.decodeIfPresent([String: [String: TrafficBytes]].self, forKey: .processIPs) ?? [:]
+        clientDomains = try c.decodeIfPresent([String: [String: TrafficBytes]].self, forKey: .clientDomains) ?? [:]
+        clientIPs = try c.decodeIfPresent([String: [String: TrafficBytes]].self, forKey: .clientIPs) ?? [:]
     }
 
-    public func map(for dimension: TrafficRankingDimension, processFilter: String? = nil) -> [String: TrafficBytes] {
+    public func map(
+        for dimension: TrafficRankingDimension,
+        processFilter: String? = nil,
+        clientFilter: String? = nil
+    ) -> [String: TrafficBytes] {
+        if let clientFilter, !clientFilter.isEmpty {
+            switch dimension {
+            case .domain: return clientDomains[clientFilter] ?? [:]
+            case .ip: return clientIPs[clientFilter] ?? [:]
+            case .client:
+                if let entry = clients[clientFilter] {
+                    return [clientFilter: entry]
+                }
+                return [:]
+            case .process:
+                return processes
+            }
+        }
         if let processFilter, !processFilter.isEmpty {
             switch dimension {
             case .domain: return processDomains[processFilter] ?? [:]
@@ -287,12 +368,15 @@ public struct TrafficDimensionBuckets: Codable, Equatable, Sendable {
                     return [processFilter: entry]
                 }
                 return [:]
+            case .client:
+                return clients
             }
         }
         switch dimension {
         case .domain: return domains
         case .ip: return ips
         case .process: return processes
+        case .client: return clients
         }
     }
 
@@ -300,17 +384,28 @@ public struct TrafficDimensionBuckets: Codable, Equatable, Sendable {
         Self.mergeMap(deltas.domains, into: &domains, maxEntries: maxEntriesPerDimension)
         Self.mergeMap(deltas.ips, into: &ips, maxEntries: maxEntriesPerDimension)
         Self.mergeMap(deltas.processes, into: &processes, maxEntries: maxEntriesPerDimension)
+        Self.mergeMap(deltas.clients, into: &clients, maxEntries: maxEntriesPerDimension)
 
-        let maxTargetsPerProcess = max(30, maxEntriesPerDimension / 4)
+        let maxTargetsPerGroup = max(30, maxEntriesPerDimension / 4)
         for (proc, map) in deltas.processDomains {
             var existing = processDomains[proc] ?? [:]
-            Self.mergeMap(map, into: &existing, maxEntries: maxTargetsPerProcess)
+            Self.mergeMap(map, into: &existing, maxEntries: maxTargetsPerGroup)
             processDomains[proc] = existing
         }
         for (proc, map) in deltas.processIPs {
             var existing = processIPs[proc] ?? [:]
-            Self.mergeMap(map, into: &existing, maxEntries: maxTargetsPerProcess)
+            Self.mergeMap(map, into: &existing, maxEntries: maxTargetsPerGroup)
             processIPs[proc] = existing
+        }
+        for (client, map) in deltas.clientDomains {
+            var existing = clientDomains[client] ?? [:]
+            Self.mergeMap(map, into: &existing, maxEntries: maxTargetsPerGroup)
+            clientDomains[client] = existing
+        }
+        for (client, map) in deltas.clientIPs {
+            var existing = clientIPs[client] ?? [:]
+            Self.mergeMap(map, into: &existing, maxEntries: maxTargetsPerGroup)
+            clientIPs[client] = existing
         }
     }
 
@@ -429,9 +524,11 @@ public struct TrafficRankingAccumulator: Codable, Equatable, Sendable {
         dimension: TrafficRankingDimension,
         window: TrafficRankingWindow,
         processFilter: String? = nil,
+        clientFilter: String? = nil,
         sortBy: TrafficRankingSortField = .total,
         ascending: Bool = false,
         searchText: String = "",
+        displayAliases: [String: String] = [:],
         at now: Date = Date(),
         calendar: Calendar = .current
     ) -> TrafficRankingReport {
@@ -447,7 +544,7 @@ public struct TrafficRankingAccumulator: Codable, Equatable, Sendable {
             var count = 0
             for (epoch, bucket) in minuteBuckets where epoch >= earliestMinute && epoch <= currentMinute {
                 count += 1
-                for (key, bytes) in bucket.map(for: dimension, processFilter: processFilter) where bytes.total > 0 {
+                for (key, bytes) in bucket.map(for: dimension, processFilter: processFilter, clientFilter: clientFilter) where bytes.total > 0 {
                     var acc = totals[key] ?? .zero
                     acc.add(upload: bytes.upload, download: bytes.download)
                     totals[key] = acc
@@ -461,7 +558,7 @@ public struct TrafficRankingAccumulator: Codable, Equatable, Sendable {
             let key = TrafficHistoryAccumulator.dayKey(for: now, calendar: calendar)
             if let bucket = dailyBuckets[key] {
                 activeBucketCount = 1
-                for (entryKey, bytes) in bucket.map(for: dimension, processFilter: processFilter) where bytes.total > 0 {
+                for (entryKey, bytes) in bucket.map(for: dimension, processFilter: processFilter, clientFilter: clientFilter) where bytes.total > 0 {
                     var acc = totals[entryKey] ?? .zero
                     acc.add(upload: bytes.upload, download: bytes.download)
                     totals[entryKey] = acc
@@ -482,7 +579,7 @@ public struct TrafficRankingAccumulator: Codable, Equatable, Sendable {
             var count = 0
             for (key, bucket) in dailyBuckets where keys.contains(key) {
                 count += 1
-                for (entryKey, bytes) in bucket.map(for: dimension, processFilter: processFilter) where bytes.total > 0 {
+                for (entryKey, bytes) in bucket.map(for: dimension, processFilter: processFilter, clientFilter: clientFilter) where bytes.total > 0 {
                     var acc = totals[entryKey] ?? .zero
                     acc.add(upload: bytes.upload, download: bytes.download)
                     totals[entryKey] = acc
@@ -498,8 +595,11 @@ public struct TrafficRankingAccumulator: Codable, Equatable, Sendable {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let items: [TrafficRankingItem] = totals.compactMap { key, bytes in
             guard bytes.total > 0 else { return nil }
-            if !query.isEmpty && !key.lowercased().contains(query) {
-                return nil
+            if !query.isEmpty {
+                let aliasMatch = displayAliases[key]?.lowercased().contains(query) ?? false
+                if !key.lowercased().contains(query) && !aliasMatch {
+                    return nil
+                }
             }
             let pct = grandTotal > 0 ? (Double(bytes.total) / Double(grandTotal) * 100.0) : 0
             return TrafficRankingItem(

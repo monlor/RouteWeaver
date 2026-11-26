@@ -23,9 +23,19 @@ public struct ProfileStore: Sendable {
     public let defaultDirectory: URL
     public var customDirectory: URL?
 
+    public static var platformDefaultDirectory: URL {
+        #if os(macOS)
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/RouteWeaver", isDirectory: true)
+        #else
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        return base.appendingPathComponent("RouteWeaver", isDirectory: true)
+        #endif
+    }
+
     public init(
-        defaultDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/RouteWeaver", isDirectory: true),
+        defaultDirectory: URL = ProfileStore.platformDefaultDirectory,
         customDirectory: URL? = nil
     ) {
         self.defaultDirectory = defaultDirectory.standardizedFileURL

@@ -215,8 +215,8 @@ public enum MihomoConfig {
             throw RoutingConfigurationError.invalidTarget("默认兜底目标不存在，请重新选择。")
         }
 
-        // Verify every enabled rule group with rules points to an existing target
-        for group in profile.ruleGroups where group.isEnabled && !group.rules.filter(\.isEnabled).isEmpty {
+        // Verify every effectively active rule group points to an existing target
+        for group in profile.ruleGroups where group.isEffectivelyActive {
             if case .target(let id) = group.target, outboundNameByTargetID[id] == nil {
                 throw RoutingConfigurationError.invalidTarget("规则组「\(group.name)」指向的网络目标不存在。")
             }
@@ -451,6 +451,9 @@ public enum MihomoConfig {
                 ],
             ]
         }
+        if !builtRules.subRules.isEmpty {
+            config["sub-rules"] = builtRules.subRules
+        }
         if !builtRules.ruleProviders.isEmpty {
             config["rule-providers"] = builtRules.ruleProviders
         }
@@ -659,6 +662,7 @@ public enum MihomoConfig {
 
     private struct BuiltRulesResult {
         let rules: [String]
+        let subRules: [String: [String]]
         let ruleProviders: [String: [String: Any]]
         let hasProcessRule: Bool
         let dnsPolicies: [(key: String, servers: [String])]
@@ -918,13 +922,34 @@ public enum MihomoConfig {
         interfaceDNS: [String: [String]]
     ) throws -> BuiltRulesResult {
         var result: [String] = []
+        var subRules: [String: [String]] = [:]
         var ruleProviders: [String: [String: Any]] = [:]
         var hasProcessRule = false
         var dnsPolicies: [(key: String, servers: [String])] = []
 
-        for group in profile.ruleGroups where group.isEnabled {
+        for (groupIndex, group) in profile.ruleGroups.enumerated() where group.isEnabled {
             let enabledRules = group.rules.filter(\.isEnabled)
             guard !enabledRules.isEmpty else { continue }
+
+            var clientCIDRs: [String] = []
+            if group.clientScopeMode != .all {
+                let enabledClients = group.enabledClientEntries
+                if group.clientScopeMode == .include && enabledClients.isEmpty {
+                    continue
+                }
+                var seenCIDRs = Set<String>()
+                for entry in enabledClients {
+                    guard let cidr = ClientAddressValidator.normalizedCIDR(entry.address) else {
+                        throw RoutingConfigurationError.invalidRule(
+                            "规则组「\(group.name)」中的生效设备地址「\(entry.address)」格式无效，请输入有效的 IPv4/IPv6 地址或 CIDR 网段。"
+                        )
+                    }
+                    if seenCIDRs.insert(cidr).inserted {
+                        clientCIDRs.append(cidr)
+                    }
+                }
+            }
+            let isClientScoped = group.clientScopeMode != .all && !clientCIDRs.isEmpty
 
             let targetName: String
             let groupDNSServers: [String]?
@@ -937,25 +962,32 @@ public enum MihomoConfig {
                     throw RoutingConfigurationError.invalidTarget("规则组「\(group.name)」指向的网络目标不存在。")
                 }
                 targetName = resolved
-                switch target.mode {
-                case .proxy:
-                    groupDNSServers = proxyDoH(group: resolved)
-                case .direct:
-                    let customDirect = profile.customDNS.directServers
-                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                        .filter { !$0.isEmpty }
-                    groupDNSServers = directTargetDNS(
-                        outboundName: resolved,
-                        interface: boundInterfaceByTargetID[id],
-                        interfaceDNS: interfaceDNS,
-                        customDirectServers: customDirect,
-                        avoidSystemDNS: profile.effectiveTunEnabled
-                    )
-                case .alias:
+                if isClientScoped {
+                    // `dns.nameserver-policy` is global and cannot match by client source IP;
+                    // skip emitting global DNS policies for device-scoped groups so other devices are unaffected.
                     groupDNSServers = nil
+                } else {
+                    switch target.mode {
+                    case .proxy:
+                        groupDNSServers = proxyDoH(group: resolved)
+                    case .direct:
+                        let customDirect = profile.customDNS.directServers
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                        groupDNSServers = directTargetDNS(
+                            outboundName: resolved,
+                            interface: boundInterfaceByTargetID[id],
+                            interfaceDNS: interfaceDNS,
+                            customDirectServers: customDirect,
+                            avoidSystemDNS: profile.effectiveTunEnabled
+                        )
+                    case .alias:
+                        groupDNSServers = nil
+                    }
                 }
             }
 
+            var groupRules: [String] = []
             for rule in enabledRules {
                 let value = rule.value.trimmingCharacters(in: .whitespacesAndNewlines)
                 if rule.type == .ruleSet {
@@ -989,9 +1021,9 @@ public enum MihomoConfig {
                         dnsPolicies.append(("rule-set:\(key)", servers))
                     }
                     if rule.ruleSetNoResolve == true {
-                        result.append("RULE-SET,\(key),\(targetName),no-resolve")
+                        groupRules.append("RULE-SET,\(key),\(targetName),no-resolve")
                     } else {
-                        result.append("RULE-SET,\(key),\(targetName)")
+                        groupRules.append("RULE-SET,\(key),\(targetName)")
                     }
                     continue
                 }
@@ -1008,6 +1040,11 @@ public enum MihomoConfig {
                 if rule.type == .dstPort {
                     guard let port = Int(value), (1...65535).contains(port) else {
                         throw RoutingConfigurationError.invalidRule("DST-PORT 必须为 1–65535 的整数。")
+                    }
+                }
+                if rule.type == .srcIPCIDR {
+                    guard ClientAddressValidator.normalizedCIDR(value) != nil else {
+                        throw RoutingConfigurationError.invalidRule("规则组「\(group.name)」的 SRC-IP-CIDR 规则「\(value)」格式无效，请输入有效的 IPv4/IPv6 地址或 CIDR 网段。")
                     }
                 }
                 if rule.type.isProcessRule {
@@ -1030,7 +1067,16 @@ public enum MihomoConfig {
                         break
                     }
                 }
-                result.append(rule.formatted(target: targetName))
+                groupRules.append(rule.formatted(target: targetName))
+            }
+
+            if isClientScoped {
+                let subRuleName = "rg-\(groupIndex)-\(shortHash(group.id.uuidString))"
+                let condition = clientScopeCondition(mode: group.clientScopeMode, cidrs: clientCIDRs)
+                result.append("SUB-RULE,\(condition),\(subRuleName)")
+                subRules[subRuleName] = groupRules
+            } else {
+                result.append(contentsOf: groupRules)
             }
         }
 
@@ -1047,10 +1093,27 @@ public enum MihomoConfig {
         result.append("MATCH,\(fallbackName)")
         return BuiltRulesResult(
             rules: result,
+            subRules: subRules,
             ruleProviders: ruleProviders,
             hasProcessRule: hasProcessRule,
             dnsPolicies: dnsPolicies
         )
+    }
+
+    private static func clientScopeCondition(mode: RuleGroupClientScopeMode, cidrs: [String]) -> String {
+        let matchExpr: String
+        if cidrs.count == 1 {
+            matchExpr = "(SRC-IP-CIDR,\(cidrs[0]))"
+        } else {
+            let items = cidrs.map { "(SRC-IP-CIDR,\($0))" }.joined(separator: ",")
+            matchExpr = "(OR,(\(items)))"
+        }
+        switch mode {
+        case .exclude:
+            return "(NOT,(\(matchExpr)))"
+        case .include, .all:
+            return matchExpr
+        }
     }
 
     private static let githubHosts: Set<String> = [

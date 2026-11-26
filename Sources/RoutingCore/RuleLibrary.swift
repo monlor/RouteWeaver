@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum RuleType: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -6,6 +7,7 @@ public enum RuleType: String, Codable, CaseIterable, Identifiable, Sendable {
     case domainKeyword = "DOMAIN-KEYWORD"
     case processName = "PROCESS-NAME"
     case processPath = "PROCESS-PATH"
+    case srcIPCIDR = "SRC-IP-CIDR"
     case ipCIDR = "IP-CIDR"
     case ipCIDR6 = "IP-CIDR6"
     case dstPort = "DST-PORT"
@@ -22,6 +24,7 @@ public enum RuleType: String, Codable, CaseIterable, Identifiable, Sendable {
         case .domainKeyword: return "域名关键词 (DOMAIN-KEYWORD)"
         case .processName: return "应用 / 进程名 (PROCESS-NAME)"
         case .processPath: return "进程路径 (PROCESS-PATH)"
+        case .srcIPCIDR: return "源设备 IP / 网段 (SRC-IP-CIDR)"
         case .ipCIDR: return "IPv4 网段 (IP-CIDR)"
         case .ipCIDR6: return "IPv6 网段 (IP-CIDR6)"
         case .dstPort: return "目标端口 (DST-PORT)"
@@ -38,6 +41,7 @@ public enum RuleType: String, Codable, CaseIterable, Identifiable, Sendable {
         case .domainKeyword: return "关键词"
         case .processName: return "进程/应用"
         case .processPath: return "进程路径"
+        case .srcIPCIDR: return "源设备"
         case .ipCIDR: return "IPv4"
         case .ipCIDR6: return "IPv6"
         case .dstPort: return "端口"
@@ -54,6 +58,7 @@ public enum RuleType: String, Codable, CaseIterable, Identifiable, Sendable {
         case .domainKeyword: return "例如 claude"
         case .processName: return "例如 Claude 或 curl"
         case .processPath: return "例如 /Applications/Claude.app/Contents/MacOS/Claude"
+        case .srcIPCIDR: return "例如 192.168.1.55 或 192.168.1.0/24"
         case .ipCIDR: return "例如 192.168.1.0/24"
         case .ipCIDR6: return "例如 fc00::/7"
         case .dstPort: return "例如 22"
@@ -73,6 +78,49 @@ public enum RuleType: String, Codable, CaseIterable, Identifiable, Sendable {
 
     public var allowsSpaces: Bool {
         isProcessRule
+    }
+}
+
+public enum ClientAddressValidator {
+    /// Validates and normalizes an IPv4/IPv6 address or CIDR prefix into Mihomo `SRC-IP-CIDR` format.
+    /// Examples: `192.168.1.55` -> `192.168.1.55/32`, `192.168.1.0/24` -> `192.168.1.0/24`, `fd00::1` -> `fd00::1/128`.
+    public static func normalizedCIDR(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.contains(","),
+              !trimmed.unicodeScalars.contains(where: CharacterSet.whitespacesAndNewlines.contains),
+              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            return nil
+        }
+
+        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 1 || parts.count == 2 else { return nil }
+        let ipPart = String(parts[0])
+        let prefixPart = parts.count == 2 ? String(parts[1]) : nil
+
+        var ipv4Addr = in_addr()
+        if inet_pton(AF_INET, ipPart, &ipv4Addr) == 1 {
+            if let prefixPart {
+                guard let prefix = Int(prefixPart), (0...32).contains(prefix), String(prefix) == prefixPart else {
+                    return nil
+                }
+                return "\(ipPart)/\(prefix)"
+            }
+            return "\(ipPart)/32"
+        }
+
+        var ipv6Addr = in6_addr()
+        if inet_pton(AF_INET6, ipPart, &ipv6Addr) == 1 {
+            if let prefixPart {
+                guard let prefix = Int(prefixPart), (0...128).contains(prefix), String(prefix) == prefixPart else {
+                    return nil
+                }
+                return "\(ipPart)/\(prefix)"
+            }
+            return "\(ipPart)/128"
+        }
+
+        return nil
     }
 }
 
@@ -274,10 +322,82 @@ public struct RuleItem: Codable, Equatable, Identifiable, Sendable {
 
     public func formatted(target: String) -> String {
         let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if type == .srcIPCIDR {
+            let normalized = ClientAddressValidator.normalizedCIDR(clean) ?? clean
+            return "\(type.rawValue),\(normalized),\(target)"
+        }
         if type.needsNoResolve {
             return "\(type.rawValue),\(clean),\(target),no-resolve"
         }
         return "\(type.rawValue),\(clean),\(target)"
+    }
+}
+
+public enum RuleGroupClientScopeMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case all
+    case include
+    case exclude
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .all: return "全部设备"
+        case .include: return "仅指定设备"
+        case .exclude: return "排除指定设备"
+        }
+    }
+
+    public var shortLabel: String {
+        switch self {
+        case .all: return "全部设备"
+        case .include: return "仅限设备"
+        case .exclude: return "排除设备"
+        }
+    }
+}
+
+public struct RuleGroupClientEntry: Codable, Equatable, Hashable, Identifiable, Sendable {
+    public var id: UUID
+    public var address: String
+    public var name: String
+    public var macAddress: String?
+    public var isEnabled: Bool
+
+    public init(
+        id: UUID = UUID(),
+        address: String,
+        name: String = "",
+        macAddress: String? = nil,
+        isEnabled: Bool = true
+    ) {
+        self.id = id
+        self.address = address
+        self.name = name
+        self.macAddress = macAddress
+        self.isEnabled = isEnabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        address = try c.decode(String.self, forKey: .address)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        macAddress = try c.decodeIfPresent(String.self, forKey: .macAddress)
+        isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+    }
+
+    public var normalizedCIDR: String? {
+        ClientAddressValidator.normalizedCIDR(address)
+    }
+
+    public var displayTitle: String {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedName.isEmpty && trimmedName != trimmedAddress {
+            return "\(trimmedName) (\(trimmedAddress))"
+        }
+        return trimmedAddress
     }
 }
 
@@ -318,6 +438,8 @@ public struct RuleGroup: Codable, Equatable, Identifiable, Sendable {
     public var target: TargetReference
     public var isEnabled: Bool
     public var rules: [RuleItem]
+    public var clientScopeMode: RuleGroupClientScopeMode
+    public var clientEntries: [RuleGroupClientEntry]
 
     public init(
         id: UUID = UUID(),
@@ -325,7 +447,9 @@ public struct RuleGroup: Codable, Equatable, Identifiable, Sendable {
         icon: String = "list.bullet.rectangle",
         target: TargetReference,
         isEnabled: Bool = true,
-        rules: [RuleItem] = []
+        rules: [RuleItem] = [],
+        clientScopeMode: RuleGroupClientScopeMode = .all,
+        clientEntries: [RuleGroupClientEntry] = []
     ) {
         self.id = id
         self.name = name
@@ -333,6 +457,36 @@ public struct RuleGroup: Codable, Equatable, Identifiable, Sendable {
         self.target = target
         self.isEnabled = isEnabled
         self.rules = rules
+        self.clientScopeMode = clientScopeMode
+        self.clientEntries = clientEntries
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decode(String.self, forKey: .name)
+        icon = try c.decodeIfPresent(String.self, forKey: .icon) ?? "list.bullet.rectangle"
+        target = try c.decode(TargetReference.self, forKey: .target)
+        isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        rules = try c.decodeIfPresent([RuleItem].self, forKey: .rules) ?? []
+        clientScopeMode = try c.decodeIfPresent(RuleGroupClientScopeMode.self, forKey: .clientScopeMode) ?? .all
+        clientEntries = try c.decodeIfPresent([RuleGroupClientEntry].self, forKey: .clientEntries) ?? []
+    }
+
+    public var enabledClientEntries: [RuleGroupClientEntry] {
+        clientEntries.filter(\.isEnabled)
+    }
+
+    public var isEffectivelyActive: Bool {
+        guard isEnabled, rules.contains(where: \.isEnabled) else { return false }
+        if clientScopeMode == .include && enabledClientEntries.isEmpty {
+            return false
+        }
+        return true
+    }
+
+    public var hasActiveClientScopeFilter: Bool {
+        clientScopeMode != .all && !enabledClientEntries.isEmpty
     }
 }
 

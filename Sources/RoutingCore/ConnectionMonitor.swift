@@ -156,6 +156,40 @@ public struct MonitoredConnection: Identifiable, Equatable, Sendable {
     public var rulePayload: String
     public var isActive: Bool
 
+    public init(
+        id: String,
+        metadata: MihomoConnectionMetadata,
+        upload: Int64,
+        download: Int64,
+        uploadSpeed: Int64,
+        downloadSpeed: Int64,
+        startRaw: String,
+        startDate: Date?,
+        firstSeenAt: Date,
+        lastSeenAt: Date,
+        closedAt: Date? = nil,
+        chains: [String],
+        rule: String,
+        rulePayload: String,
+        isActive: Bool
+    ) {
+        self.id = id
+        self.metadata = metadata
+        self.upload = upload
+        self.download = download
+        self.uploadSpeed = uploadSpeed
+        self.downloadSpeed = downloadSpeed
+        self.startRaw = startRaw
+        self.startDate = startDate
+        self.firstSeenAt = firstSeenAt
+        self.lastSeenAt = lastSeenAt
+        self.closedAt = closedAt
+        self.chains = chains
+        self.rule = rule
+        self.rulePayload = rulePayload
+        self.isActive = isActive
+    }
+
     public var totalBytes: Int64 { upload + download }
 
     public var hostOnly: String {
@@ -334,11 +368,25 @@ public struct ConnectionTracker: Sendable {
     public private(set) var lastSnapshotAt: Date?
     public private(set) var speedHistory: [TrafficSpeedSample] = []
     private var targetSpeedTimeline: [(id: Int64, timestamp: Date, speeds: [String: TrafficBytes])] = []
-    private var sessionTargetTotals: [String: TrafficBytes] = [:]
-    private var sessionTargetConnectionCounts: [String: Int] = [:]
+    public private(set) var sessionTargetTotals: [String: TrafficBytes] = [:]
+    public private(set) var sessionTargetConnectionCounts: [String: Int] = [:]
+    public private(set) var sessionRuleTotals: [String: TrafficBytes] = [:]
     public let maxClosedHistory: Int
     public let maxSpeedSamples: Int
     private var nextSampleID: Int64 = 1
+
+    public static func ruleSessionKey(rule: String, payload: String) -> String {
+        "\(rule)\n\(payload)"
+    }
+
+    public static func splitRuleSessionKey(_ key: String) -> (rule: String, payload: String) {
+        if let idx = key.firstIndex(of: "\n") {
+            let r = String(key[..<idx])
+            let p = String(key[key.index(after: idx)...])
+            return (r, p)
+        }
+        return (key, "")
+    }
 
     public init(maxClosedHistory: Int = 500, maxSpeedSamples: Int = 60) {
         self.maxClosedHistory = max(10, maxClosedHistory)
@@ -393,6 +441,21 @@ public struct ConnectionTracker: Sendable {
         }
     }
 
+    public func availableClients(localIPs: Set<String> = [], includeInner: Bool = true) -> [String] {
+        let clients = recordsByID.values.compactMap { item -> String? in
+            if !includeInner && item.isInner { return nil }
+            return TrafficAttribution.extractClient(from: item.metadata, localIPs: localIPs)
+        }
+        let unique = Set(clients)
+        let others = unique
+            .filter { $0 != TrafficAttribution.localDeviceLabel }
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        if unique.contains(TrafficAttribution.localDeviceLabel) {
+            return [TrafficAttribution.localDeviceLabel] + others
+        }
+        return others
+    }
+
     /// Aggregates session-wide traffic volume and connection count by primary routing target (excluding internal relay connections),
     /// sorted by total traffic descending. Retains totals even after old closed connections are trimmed.
     public var targetTrafficStats: [TargetTrafficStat] {
@@ -442,7 +505,11 @@ public struct ConnectionTracker: Sendable {
         }
     }
 
-    public mutating func ingest(_ snapshot: MihomoConnectionsSnapshot, at now: Date = Date()) {
+    public mutating func ingest(
+        _ snapshot: MihomoConnectionsSnapshot,
+        localIPs: Set<String> = [],
+        at now: Date = Date()
+    ) {
         let hadPrevious = (lastSnapshotAt != nil)
         let elapsed: TimeInterval?
         if let previous = lastSnapshotAt {
@@ -517,11 +584,17 @@ public struct ConnectionTracker: Sendable {
                     sessionAcc.add(upload: connUpDelta, download: connDownDelta)
                     sessionTargetTotals[targetName] = sessionAcc
 
-                    let attr = TrafficAttribution.extract(from: conn.metadata)
+                    let rKey = Self.ruleSessionKey(rule: conn.rule, payload: conn.rulePayload)
+                    var ruleAcc = sessionRuleTotals[rKey] ?? .zero
+                    ruleAcc.add(upload: connUpDelta, download: connDownDelta)
+                    sessionRuleTotals[rKey] = ruleAcc
+
+                    let attr = TrafficAttribution.extract(from: conn.metadata, localIPs: localIPs)
                     dimensionDeltas.add(
                         domain: attr.domain,
                         ip: attr.ip,
                         process: attr.process,
+                        client: attr.client,
                         upload: connUpDelta,
                         download: connDownDelta
                     )
@@ -553,11 +626,17 @@ public struct ConnectionTracker: Sendable {
                         sessionAcc.add(upload: connUpDelta, download: connDownDelta)
                         sessionTargetTotals[targetName] = sessionAcc
 
-                        let attr = TrafficAttribution.extract(from: conn.metadata)
+                        let rKey = Self.ruleSessionKey(rule: conn.rule, payload: conn.rulePayload)
+                        var ruleAcc = sessionRuleTotals[rKey] ?? .zero
+                        ruleAcc.add(upload: connUpDelta, download: connDownDelta)
+                        sessionRuleTotals[rKey] = ruleAcc
+
+                        let attr = TrafficAttribution.extract(from: conn.metadata, localIPs: localIPs)
                         dimensionDeltas.add(
                             domain: attr.domain,
                             ip: attr.ip,
                             process: attr.process,
+                            client: attr.client,
                             upload: connUpDelta,
                             download: connDownDelta
                         )
@@ -770,12 +849,90 @@ public struct ConnectionTracker: Sendable {
         targetSpeedTimeline.removeAll()
         sessionTargetTotals.removeAll()
         sessionTargetConnectionCounts.removeAll()
+        sessionRuleTotals.removeAll()
+    }
+
+    public mutating func applyRemoteSnapshot(
+        records: [MonitoredConnection],
+        uploadSpeed: Int64,
+        downloadSpeed: Int64,
+        uploadTotal: Int64,
+        downloadTotal: Int64,
+        memoryUsage: Int64 = 0,
+        targetSessionTotals remoteTargetTotals: [String: TrafficBytes]? = nil,
+        targetConnectionCounts remoteTargetCounts: [String: Int]? = nil,
+        targetSpeeds remoteTargetSpeeds: [String: TrafficBytes]? = nil,
+        ruleSessionTotals remoteRuleTotals: [String: TrafficBytes]? = nil,
+        at now: Date = Date()
+    ) {
+        var mapped: [String: MonitoredConnection] = [:]
+        mapped.reserveCapacity(records.count)
+        var targetTotals: [String: TrafficBytes] = [:]
+        var targetCounts: [String: Int] = [:]
+        var computedTargetSpeeds: [String: TrafficBytes] = [:]
+        var fallbackRuleTotals: [String: TrafficBytes] = [:]
+
+        for item in records {
+            mapped[item.id] = item
+            if !item.isInner {
+                let target = item.primaryTarget
+                targetCounts[target, default: 0] += 1
+                var total = targetTotals[target] ?? .zero
+                total.add(upload: item.upload, download: item.download)
+                targetTotals[target] = total
+                if item.upload > 0 || item.download > 0 {
+                    let rKey = Self.ruleSessionKey(rule: item.rule, payload: item.rulePayload)
+                    var rTotal = fallbackRuleTotals[rKey] ?? .zero
+                    rTotal.add(upload: item.upload, download: item.download)
+                    fallbackRuleTotals[rKey] = rTotal
+                }
+                if item.uploadSpeed > 0 || item.downloadSpeed > 0 {
+                    var spd = computedTargetSpeeds[target] ?? .zero
+                    spd.add(upload: item.uploadSpeed, download: item.downloadSpeed)
+                    computedTargetSpeeds[target] = spd
+                }
+            }
+        }
+
+        let effectiveTargetSpeeds = remoteTargetSpeeds ?? computedTargetSpeeds
+
+        self.recordsByID = mapped
+        self.uploadSpeed = uploadSpeed
+        self.downloadSpeed = downloadSpeed
+        self.uploadTotal = uploadTotal
+        self.downloadTotal = downloadTotal
+        self.memoryUsage = memoryUsage
+        self.lastSnapshotAt = now
+        self.sessionTargetTotals = remoteTargetTotals ?? targetTotals
+        self.sessionTargetConnectionCounts = remoteTargetCounts ?? targetCounts
+        self.targetSpeeds = effectiveTargetSpeeds
+        self.sessionRuleTotals = remoteRuleTotals ?? fallbackRuleTotals
+
+        let sampleID = nextSampleID
+        nextSampleID += 1
+        let sample = TrafficSpeedSample(
+            id: sampleID,
+            timestamp: now,
+            uploadSpeed: uploadSpeed,
+            downloadSpeed: downloadSpeed
+        )
+        speedHistory.append(sample)
+        if speedHistory.count > maxSpeedSamples {
+            speedHistory.removeFirst(speedHistory.count - maxSpeedSamples)
+        }
+        targetSpeedTimeline.append((id: sampleID, timestamp: now, speeds: effectiveTargetSpeeds))
+        if targetSpeedTimeline.count > maxSpeedSamples {
+            targetSpeedTimeline.removeFirst(targetSpeedTimeline.count - maxSpeedSamples)
+        }
     }
 
     public func filtered(
         scope: ConnectionFilterScope = .all,
         searchText: String = "",
         targetFilter: String? = nil,
+        clientFilter: String? = nil,
+        localIPs: Set<String> = [],
+        clientDisplayNames: [String: String] = [:],
         sortOrder: ConnectionSortOrder = .newest,
         ruleIndex: RuleMatchDisplayIndex? = nil,
         includeInner: Bool = true
@@ -797,12 +954,20 @@ public struct ConnectionTracker: Sendable {
                 return false
             }
 
+            let resolvedClient = TrafficAttribution.extractClient(from: item.metadata, localIPs: localIPs)
+            if let clientFilter, !clientFilter.isEmpty, resolvedClient != clientFilter {
+                return false
+            }
+
             if !query.isEmpty {
                 let resolved = ruleIndex?.resolve(rule: item.rule, payload: item.rulePayload)
+                let clientName = clientDisplayNames[resolvedClient] ?? ""
                 let haystacks = [
                     item.displayAddress,
                     item.metadata.destinationIP,
                     item.metadata.sourceIP,
+                    resolvedClient,
+                    clientName,
                     item.processDisplayName,
                     item.metadata.processPath,
                     item.rule,
@@ -1266,6 +1431,8 @@ public struct RuleMatchDisplayIndex: Sendable {
                 let payloadKey: String
                 if rule.type == .ruleSet {
                     payloadKey = MihomoConfig.ruleSetProviderKey(for: rawValue).lowercased()
+                } else if rule.type == .srcIPCIDR {
+                    payloadKey = (ClientAddressValidator.normalizedCIDR(rawValue) ?? rawValue).lowercased()
                 } else {
                     payloadKey = rawValue.lowercased()
                 }
@@ -1315,6 +1482,14 @@ public struct DNSLogTracker: Equatable, Sendable {
 
     public mutating func clear() {
         records.removeAll()
+    }
+
+    public mutating func replaceAll(_ newRecords: [DNSLogRecord]) {
+        if newRecords.count > maxRecords {
+            records = Array(newRecords.prefix(maxRecords))
+        } else {
+            records = newRecords
+        }
     }
 
     public var failedCount: Int {

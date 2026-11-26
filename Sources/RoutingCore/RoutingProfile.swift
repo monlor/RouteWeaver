@@ -575,7 +575,7 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
     /// or custom DNS server entries — expanded transitively through any `.alias` targets.
     public var activeTargetIDs: Set<UUID> {
         var seeds = Set<UUID>()
-        for group in ruleGroups where group.isEnabled && !group.rules.filter(\.isEnabled).isEmpty {
+        for group in ruleGroups where group.isEffectivelyActive {
             if case .target(let id) = group.target {
                 seeds.insert(id)
             }
@@ -584,7 +584,7 @@ public struct RoutingProfile: Codable, Equatable, Sendable {
             seeds.insert(id)
         }
         if case .target(let id) = ruleProviderProxyMode,
-           ruleGroups.contains(where: { $0.isEnabled && $0.rules.contains(where: { $0.isEnabled && $0.type == .ruleSet }) }) {
+           ruleGroups.contains(where: { $0.isEffectivelyActive && $0.rules.contains(where: { $0.isEnabled && $0.type == .ruleSet }) }) {
             seeds.insert(id)
         }
         for entry in customDNS.entries where entry.isEnabled && entry.kind == .server {

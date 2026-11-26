@@ -246,4 +246,77 @@ final class TrafficRankingTests: XCTestCase {
         XCTAssertEqual(actualUpload, expectedUpload)
         XCTAssertEqual(actualDownload, expectedDownload)
     }
+
+    func testClientDeviceAttributionRankingAndConnectionFilter() throws {
+        let localIPs: Set<String> = ["192.168.100.73"]
+        let now = Date()
+
+        var tracker = ConnectionTracker()
+        let snapshot = MihomoConnectionsSnapshot(
+            downloadTotal: 5_000,
+            uploadTotal: 1_500,
+            memory: 0,
+            connections: [
+                MihomoConnection(
+                    id: "local-1",
+                    metadata: MihomoConnectionMetadata(
+                        network: "tcp",
+                        sourceIP: "192.168.100.73",
+                        destinationIP: "140.82.114.6",
+                        host: "github.com",
+                        process: "Cursor"
+                    ),
+                    upload: 500,
+                    download: 1_000,
+                    start: "",
+                    chains: ["Proxy"],
+                    rule: "MATCH",
+                    rulePayload: ""
+                ),
+                MihomoConnection(
+                    id: "lan-iphone",
+                    metadata: MihomoConnectionMetadata(
+                        network: "tcp",
+                        sourceIP: "192.168.100.42",
+                        destinationIP: "17.253.144.10",
+                        host: "apple.com"
+                    ),
+                    upload: 1_000,
+                    download: 4_000,
+                    start: "",
+                    chains: ["Proxy"],
+                    rule: "MATCH",
+                    rulePayload: ""
+                ),
+            ]
+        )
+
+        tracker.ingest(snapshot, localIPs: localIPs, at: now)
+        XCTAssertEqual(tracker.availableClients(localIPs: localIPs), [TrafficAttribution.localDeviceLabel, "192.168.100.42"])
+
+        let filteredByLAN = tracker.filtered(clientFilter: "192.168.100.42", localIPs: localIPs)
+        XCTAssertEqual(filteredByLAN.map(\.id), ["lan-iphone"])
+
+        let filteredByAlias = tracker.filtered(
+            searchText: "iphone",
+            localIPs: localIPs,
+            clientDisplayNames: ["192.168.100.42": "iPhone-16"]
+        )
+        XCTAssertEqual(filteredByAlias.map(\.id), ["lan-iphone"])
+
+        var acc = TrafficRankingAccumulator()
+        acc.record(tracker.lastDimensionDeltas, at: now)
+
+        let clients = acc.report(dimension: .client, window: .today, at: now)
+        XCTAssertEqual(clients.items.map(\.key), ["192.168.100.42", TrafficAttribution.localDeviceLabel])
+        XCTAssertEqual(clients.items[0].total, 5_000)
+        XCTAssertEqual(clients.items[1].total, 1_500)
+
+        let iphoneDomains = acc.report(dimension: .domain, window: .today, clientFilter: "192.168.100.42", at: now)
+        XCTAssertEqual(iphoneDomains.items.map(\.key), ["apple.com"])
+        XCTAssertEqual(iphoneDomains.grandTotal, 5_000)
+
+        let iphoneIPs = acc.report(dimension: .ip, window: .today, clientFilter: "192.168.100.42", at: now)
+        XCTAssertEqual(iphoneIPs.items.map(\.key), ["17.253.144.10"])
+    }
 }
