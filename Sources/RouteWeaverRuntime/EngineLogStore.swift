@@ -16,6 +16,10 @@ final class EngineLogStore: ObservableObject {
         text = ""
     }
 
+    func replaceText(_ newText: String) {
+        text = Self.truncate(Self.sanitize(newText))
+    }
+
     func resetForNewRun(logURL: URL) {
         stopTailing()
         text = ""

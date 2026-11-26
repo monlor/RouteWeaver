@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import SystemConfiguration
@@ -881,6 +882,263 @@ private func runMihomo(
     }
 }
 
+// MARK: - Root-Side Mihomo Release Self-Update
+
+private func runSanitizedCommand(
+    executable: String,
+    arguments: [String],
+    stdoutFD: Int32? = nil,
+    captureOutput: Bool = false
+) -> (status: Int32, output: String) {
+    let argvStrings = [executable] + arguments
+    let envStrings = [
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME=/var/root",
+    ]
+    let cArgv: [UnsafeMutablePointer<CChar>?] = argvStrings.map { strdup($0) } + [nil]
+    let cEnv: [UnsafeMutablePointer<CChar>?] = envStrings.map { strdup($0) } + [nil]
+    defer {
+        for ptr in cArgv { free(ptr) }
+        for ptr in cEnv { free(ptr) }
+    }
+
+    var outPipe: [Int32] = [-1, -1]
+    if captureOutput {
+        guard pipe(&outPipe) == 0 else { return (71, "pipe failed") }
+    }
+
+    var fileActions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&fileActions)
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+    posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+
+    if let stdoutFD {
+        posix_spawn_file_actions_adddup2(&fileActions, stdoutFD, STDOUT_FILENO)
+        posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+    } else if captureOutput {
+        posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&fileActions, outPipe[1], STDERR_FILENO)
+        posix_spawn_file_actions_addclose(&fileActions, outPipe[0])
+        posix_spawn_file_actions_addclose(&fileActions, outPipe[1])
+    } else {
+        posix_spawn_file_actions_addopen(&fileActions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+        posix_spawn_file_actions_addopen(&fileActions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+    }
+
+    var pid: pid_t = 0
+    let spawnErr = posix_spawn(&pid, executable, &fileActions, nil, cArgv, cEnv)
+    if captureOutput {
+        close(outPipe[1])
+    }
+    guard spawnErr == 0, pid > 0 else {
+        if captureOutput { close(outPipe[0]) }
+        return (71, "posix_spawn \(executable) failed (errno \(spawnErr))")
+    }
+
+    var captured = Data()
+    if captureOutput {
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = Darwin.read(outPipe[0], &buf, buf.count)
+            if n > 0 {
+                captured.append(buf, count: n)
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else {
+                break
+            }
+        }
+        close(outPipe[0])
+    }
+
+    var status: Int32 = 0
+    _ = waitpid(pid, &status, 0)
+    let text = String(decoding: captured, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    return (exitCode(from: status), text)
+}
+
+private func sha256HexOfFile(at path: String) -> String? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    while true {
+        guard let chunk = try? handle.read(upToCount: 262_144), !chunk.isEmpty else {
+            break
+        }
+        hasher.update(data: chunk)
+    }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+private func extractSemanticVersion(from versionOutput: String) -> String? {
+    for token in versionOutput.split(whereSeparator: { $0.isWhitespace }) {
+        let str = String(token)
+        if str.hasPrefix("v"), str.count >= 6 {
+            let body = str.dropFirst()
+            let parts = body.split(separator: "-")
+            let nums = parts.first?.split(separator: ".") ?? []
+            if nums.count == 3, nums.allSatisfy({ Int($0) != nil }) {
+                return str
+            }
+        }
+    }
+    return nil
+}
+
+private func updateAuthorizedMihomo(
+    downloadURL: String,
+    expectedSHA256: String?,
+    proxyPort: Int?,
+    restartDaemon: Bool
+) -> Int32 {
+    guard geteuid() == 0 else {
+        writeStderr("RouteWeaverTunHelper: root privileges (setuid) are required")
+        return 77
+    }
+    guard TunHelperPaths.isTrustedMihomoReleaseURL(downloadURL) else {
+        writeStderr("RouteWeaverTunHelper: untrusted Mihomo release URL")
+        return 64
+    }
+    if let expectedSHA256, !TunHelperPaths.isValidSHA256Hex(expectedSHA256) {
+        writeStderr("RouteWeaverTunHelper: invalid SHA-256 digest")
+        return 64
+    }
+
+    _ = setgid(0)
+    _ = setuid(0)
+
+    var dirStat = stat()
+    guard lstat(TunHelperPaths.installDirectoryPath, &dirStat) == 0,
+          (dirStat.st_mode & S_IFMT) == S_IFDIR,
+          dirStat.st_uid == 0,
+          (dirStat.st_mode & 0o002) == 0 else {
+        writeStderr("RouteWeaverTunHelper: install directory \(TunHelperPaths.installDirectoryPath) is missing or not root-owned")
+        return 77
+    }
+
+    let stagingDir = "\(TunHelperPaths.installDirectoryPath)/.mihomo-staging-\(getpid())-\(arc4random())"
+    guard mkdir(stagingDir, 0o700) == 0 else {
+        writeStderr("RouteWeaverTunHelper: failed to create secure staging directory (errno \(errno))")
+        return 73
+    }
+    _ = chown(stagingDir, 0, 0)
+    defer {
+        try? FileManager.default.removeItem(atPath: stagingDir)
+    }
+
+    let archivePath = "\(stagingDir)/mihomo.gz"
+    let stagedBinaryPath = "\(stagingDir)/mihomo"
+
+    let baseCurlArgs = [
+        "-fsSL",
+        "--proto", "=https",
+        "--tlsv1.2",
+        "--connect-timeout", "20",
+        "--max-time", "180",
+        "-H", "User-Agent: RouteWeaverTunHelper/1.0",
+    ]
+    var curlResult: (status: Int32, output: String)
+    if let proxyPort, (1...65535).contains(proxyPort) {
+        curlResult = runSanitizedCommand(
+            executable: "/usr/bin/curl",
+            arguments: baseCurlArgs + ["-x", "http://127.0.0.1:\(proxyPort)", "-o", archivePath, downloadURL],
+            captureOutput: true
+        )
+        if curlResult.status != 0 {
+            _ = unlink(archivePath)
+            curlResult = runSanitizedCommand(
+                executable: "/usr/bin/curl",
+                arguments: baseCurlArgs + ["-o", archivePath, downloadURL],
+                captureOutput: true
+            )
+        }
+    } else {
+        curlResult = runSanitizedCommand(
+            executable: "/usr/bin/curl",
+            arguments: baseCurlArgs + ["-o", archivePath, downloadURL],
+            captureOutput: true
+        )
+    }
+
+    guard curlResult.status == 0 else {
+        writeStderr("RouteWeaverTunHelper: failed to download Mihomo release (\(curlResult.output))")
+        return 75
+    }
+
+    var archiveStat = stat()
+    guard lstat(archivePath, &archiveStat) == 0,
+          (archiveStat.st_mode & S_IFMT) == S_IFREG,
+          archiveStat.st_size > 1024 else {
+        writeStderr("RouteWeaverTunHelper: downloaded archive is invalid or empty")
+        return 65
+    }
+
+    if let expected = expectedSHA256?.lowercased() {
+        guard let actual = sha256HexOfFile(at: archivePath), actual == expected else {
+            writeStderr("RouteWeaverTunHelper: SHA-256 verification failed for downloaded Mihomo archive")
+            return 65
+        }
+    }
+
+    let outFD = open(stagedBinaryPath, O_WRONLY | O_CREAT | O_EXCL, 0o755)
+    guard outFD >= 0 else {
+        writeStderr("RouteWeaverTunHelper: failed to open staged binary file")
+        return 73
+    }
+    let gunzipRes = runSanitizedCommand(
+        executable: "/usr/bin/gzip",
+        arguments: ["-dc", archivePath],
+        stdoutFD: outFD
+    )
+    _ = fchown(outFD, 0, 0)
+    _ = fchmod(outFD, 0o755)
+    close(outFD)
+
+    guard gunzipRes.status == 0 else {
+        writeStderr("RouteWeaverTunHelper: failed to decompress Mihomo archive")
+        return 65
+    }
+
+    _ = runSanitizedCommand(executable: "/usr/bin/xattr", arguments: ["-d", "com.apple.quarantine", stagedBinaryPath])
+    let signRes = runSanitizedCommand(
+        executable: "/usr/bin/codesign",
+        arguments: ["--force", "--sign", "-", stagedBinaryPath],
+        captureOutput: true
+    )
+    guard signRes.status == 0 else {
+        writeStderr("RouteWeaverTunHelper: codesign failed (\(signRes.output))")
+        return 71
+    }
+
+    let verRes = runSanitizedCommand(
+        executable: stagedBinaryPath,
+        arguments: ["-v"],
+        captureOutput: true
+    )
+    guard verRes.status == 0,
+          verRes.output.localizedCaseInsensitiveContains("mihomo"),
+          let parsedVer = extractSemanticVersion(from: verRes.output) else {
+        writeStderr("RouteWeaverTunHelper: staged Mihomo binary failed version verification")
+        return 65
+    }
+
+    guard rename(stagedBinaryPath, TunHelperPaths.authorizedMihomoPath) == 0 else {
+        writeStderr("RouteWeaverTunHelper: atomic replace of authorized mihomo failed (errno \(errno))")
+        return 73
+    }
+    guard verifyAuthorizedMihomo() else {
+        return 77
+    }
+
+    if restartDaemon, runLaunchctl(["print", TunHelperPaths.tunServiceTarget]) == 0 {
+        _ = runLaunchctl(["kickstart", "-k", TunHelperPaths.tunServiceTarget])
+    }
+
+    let line = Array("\(TunHelperPaths.updatedVersionOutputPrefix)\(parsedVer)\n".utf8)
+    _ = line.withUnsafeBytes { Darwin.write(STDOUT_FILENO, $0.baseAddress, $0.count) }
+    return 0
+}
+
 private func runHelper() -> Int32 {
     let command: TunHelperCommand
     do {
@@ -918,6 +1176,13 @@ private func runHelper() -> Int32 {
         )
     case .stopPid(let pid):
         return stopAuthorizedPid(pid)
+    case .updateMihomo(let downloadURL, let expectedSHA256, let proxyPort, let restartDaemon):
+        return updateAuthorizedMihomo(
+            downloadURL: downloadURL,
+            expectedSHA256: expectedSHA256,
+            proxyPort: proxyPort,
+            restartDaemon: restartDaemon
+        )
     case .run(let workDir, let configPath, let logFilePath, let pidFilePath, let gatewayMode, let daemonRunMode):
         return runMihomo(
             workDir: workDir,

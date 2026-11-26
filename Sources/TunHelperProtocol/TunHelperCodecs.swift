@@ -202,20 +202,36 @@ public enum TunHelperPlists {
 }
 
 public enum TunHelperPFRules {
+    /// macOS `/etc/pf.conf` automatically evaluates `anchor "com.apple/*"`, so using a sub-anchor
+    /// under `com.apple/` activates rules without modifying `/etc/pf.conf`.
+    public static let anchorName = TunHelperPaths.killSwitchAnchor
+
+    /// Dedicated unused GID assigned to the authorized Mihomo process so PF can allow outbound
+    /// traffic exclusively from Mihomo itself (blocking even unrelated root daemons).
+    public static let dedicatedGID: gid_t = TunHelperPaths.mihomoDedicatedGid
+
+    /// Terminal fallback command users can run to immediately remove Kill Switch rules.
+    public static let emergencyResetCommand = TunHelperPaths.killSwitchEmergencyResetCommand
+
+    /// Maximum utun index included in the PF interface allowlist (`utun0` ... `utun31`).
+    public static let maxUtunIndex = 31
+
     public static func renderKillSwitchPFConfig(allowLAN: Bool) -> String {
-        let utunList = (0...31).map { "utun\($0)" }.joined(separator: ", ")
+        let utunList = (0...maxUtunIndex).map { "utun\($0)" }.joined(separator: ", ")
         var lines: [String] = [
-            "# RouteWeaver Kill Switch PF Anchor (\(TunHelperPaths.killSwitchAnchor))",
+            "# RouteWeaver Kill Switch PF Anchor (\(anchorName))",
             "pass quick on lo0 all",
             "pass quick on { \(utunList) } all",
-            "pass out quick proto { tcp, udp, icmp, icmp6 } from any to any user 0 group \(TunHelperPaths.mihomoDedicatedGid) keep state",
+            "pass out quick proto { tcp, udp, icmp, icmp6 } from any to any user 0 group \(dedicatedGID) keep state",
             "block drop out quick proto { tcp, udp } from any to any port 53",
             "pass out quick inet proto udp from any port 68 to any port 67",
             "pass out quick inet6 proto udp from any port 546 to any port 547",
         ]
         if allowLAN {
-            lines.append("pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } keep state")
-            lines.append("pass out quick inet6 to { fe80::/10, fc00::/7, ff00::/8 } keep state")
+            lines.append("pass in quick inet from { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } to any flags any keep state")
+            lines.append("pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } flags any keep state")
+            lines.append("pass in quick inet6 from { fe80::/10, fc00::/7 } to any flags any keep state")
+            lines.append("pass out quick inet6 to { fe80::/10, fc00::/7, ff00::/8 } flags any keep state")
         }
         lines.append("block drop out quick all")
         lines.append("")

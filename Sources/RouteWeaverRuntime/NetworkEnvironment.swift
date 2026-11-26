@@ -30,7 +30,74 @@ struct NetworkInterfaceInfo: Identifiable, Equatable, Sendable {
     }
 }
 
+struct SystemNetworkRoutingSnapshot: Equatable, Sendable {
+    let defaultGatewayIPv4: String?
+    let dnsServers: [String]
+    let httpProxyServer: String?
+    let httpsProxyServer: String?
+    let socksProxyServer: String?
+
+    init(
+        defaultGatewayIPv4: String? = nil,
+        dnsServers: [String] = [],
+        httpProxyServer: String? = nil,
+        httpsProxyServer: String? = nil,
+        socksProxyServer: String? = nil
+    ) {
+        self.defaultGatewayIPv4 = defaultGatewayIPv4
+        self.dnsServers = dnsServers
+        self.httpProxyServer = httpProxyServer
+        self.httpsProxyServer = httpsProxyServer
+        self.socksProxyServer = socksProxyServer
+    }
+}
+
 enum NetworkEnvironment {
+    static func currentRoutingSnapshot() -> SystemNetworkRoutingSnapshot {
+        var gateway: String?
+        var dnsServers: [String] = []
+
+        if let store = SCDynamicStoreCreate(nil, "RouteWeaver.RoutingInspector" as CFString, nil, nil) {
+            if let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+               let router = (globalIPv4["Router"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !router.isEmpty {
+                gateway = router
+            }
+            if let globalDNS = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
+               let servers = globalDNS["ServerAddresses"] as? [String] {
+                dnsServers = servers
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            }
+        }
+
+        var httpProxy: String?
+        var httpsProxy: String?
+        var socksProxy: String?
+
+        if let proxies = SCDynamicStoreCopyProxies(nil) as? [String: Any] {
+            func enabledServer(enableKey: CFString, proxyKey: CFString) -> String? {
+                let enabled = (proxies[enableKey as String] as? NSNumber)?.intValue ?? 0
+                guard enabled != 0,
+                      let host = (proxies[proxyKey as String] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !host.isEmpty else {
+                    return nil
+                }
+                return host
+            }
+            httpProxy = enabledServer(enableKey: kSCPropNetProxiesHTTPEnable, proxyKey: kSCPropNetProxiesHTTPProxy)
+            httpsProxy = enabledServer(enableKey: kSCPropNetProxiesHTTPSEnable, proxyKey: kSCPropNetProxiesHTTPSProxy)
+            socksProxy = enabledServer(enableKey: kSCPropNetProxiesSOCKSEnable, proxyKey: kSCPropNetProxiesSOCKSProxy)
+        }
+
+        return SystemNetworkRoutingSnapshot(
+            defaultGatewayIPv4: gateway,
+            dnsServers: dnsServers,
+            httpProxyServer: httpProxy,
+            httpsProxyServer: httpsProxy,
+            socksProxyServer: socksProxy
+        )
+    }
     static func interfaceDNSServers(includeIPv6: Bool = true) -> [String: [String]] {
         guard let store = SCDynamicStoreCreate(nil, "RouteWeaver.DNSInspector" as CFString, nil, nil),
               let keys = SCDynamicStoreCopyKeyList(store, "State:/Network/Service/[^/]+/IPv4" as CFString) as? [String] else {

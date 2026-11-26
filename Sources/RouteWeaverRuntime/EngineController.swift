@@ -63,6 +63,9 @@ final class EngineController: ObservableObject {
     }
     var mihomoWorkDirectory: URL { workDir }
     var activeWorkDirectory: URL { isTunActive ? tunWorkDir : workDir }
+    var candidateProviderWorkDirectories: [URL] {
+        isTunActive ? [tunWorkDir, workDir] : [workDir, tunWorkDir]
+    }
 
     private var lastRunLogURL: URL {
         stateDir.appendingPathComponent("last-run.log")
@@ -149,6 +152,7 @@ final class EngineController: ObservableObject {
         subscriptionCacheDirectory: URL = ProfileStore().defaultDirectory,
         sessionContext: EngineSessionContext? = nil
     ) {
+        guard activeHandle == nil, !isBusy else { return }
         pendingSessionContext = sessionContext
         begin(
             config: config,
@@ -163,8 +167,42 @@ final class EngineController: ObservableObject {
         )
     }
 
-    func updateRuntimeSession(trackedGroups: [String], runningProfile: RoutingProfile) {
+    /// Returns the authoritative `(port, secret)` of the active Mihomo core from its persisted config/session.
+    func authoritativeControlCredentials() -> (port: Int, secret: String)? {
+        let session = currentSession ?? sessionStore.load()
+        if let configPath = session?.configPath,
+           !configPath.isEmpty,
+           let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let secret = parsed["secret"] as? String,
+           !secret.isEmpty {
+            let resolvedPort: Int?
+            if let endpoint = parsed["external-controller"] as? String,
+               let colonIdx = endpoint.lastIndex(of: ":"),
+               let portVal = Int(endpoint[endpoint.index(after: colonIdx)...]),
+               (1...65535).contains(portVal) {
+                resolvedPort = portVal
+            } else {
+                resolvedPort = session?.controllerPort
+            }
+            if let port = resolvedPort, (1...65535).contains(port) {
+                return (port, secret)
+            }
+        }
+        if let session, (1...65535).contains(session.controllerPort), !session.secret.isEmpty {
+            return (session.controllerPort, session.secret)
+        }
+        return nil
+    }
+
+    func updateRuntimeSession(controllerPort: Int? = nil, secret: String? = nil, trackedGroups: [String], runningProfile: RoutingProfile) {
         guard var session = currentSession else { return }
+        if let controllerPort {
+            session.controllerPort = controllerPort
+        }
+        if let secret {
+            session.secret = secret
+        }
         session.trackedGroups = trackedGroups
         session.runningProfile = runningProfile
         currentSession = session
@@ -362,18 +400,31 @@ final class EngineController: ObservableObject {
             append(msg + "\n")
             return
         }
+        var validationBinary = binary
         if startAfterValidation && useTun {
             let tunStatus = driver.checkTunPermission(for: binary)
-            guard tunStatus == .ready else {
+            guard tunStatus.canLaunchTun else {
                 let modeLabel = useGateway ? "局域网网关模式" : "TUN 模式"
                 let msg = "\(modeLabel)尚未完成管理员授权（\(tunStatus.title)），请先在「设置与日志」中授权权限。"
                 lastError = msg
                 append(msg + "\n")
                 return
             }
+            if tunStatus == .needsSync,
+               FileManager.default.isExecutableFile(atPath: TunHelperPaths.authorizedMihomoPath) {
+                validationBinary = TunHelperPaths.installedMihomoURL
+            }
         }
-        if startAfterValidation, !(checkInterfaces(interfaces) && checkPorts(config, useTun: useTun)) { return }
+        if startAfterValidation {
+            guard checkPorts(config, useTun: useTun) else { return }
+        }
         logStore.resetForNewRun(logURL: lastRunLogURL)
+        if startAfterValidation && useTun && driver.checkTunPermission(for: binary) == .needsSync {
+            append("提示：检测到新版辅助组件或内核待同步，本次继续使用已授权的受信任内核启动（避免远程网关断网）。\n")
+        }
+        if startAfterValidation {
+            logMissingInterfacesWarning(interfaces)
+        }
 
         let configPath: URL
         do {
@@ -399,7 +450,7 @@ final class EngineController: ObservableObject {
                 token: token,
                 config: config,
                 configPath: configPath,
-                binary: binary,
+                binary: validationBinary,
                 interfaces: interfaces,
                 useTun: useTun,
                 useGateway: useGateway,
@@ -505,7 +556,7 @@ final class EngineController: ObservableObject {
             }
 
             append("Mihomo 配置校验通过。\n")
-            guard startAfterValidation, checkInterfaces(interfaces), checkPorts(config, useTun: useTun) else {
+            guard startAfterValidation, checkPorts(config, useTun: useTun) else {
                 cleanup()
                 return
             }
@@ -713,17 +764,16 @@ final class EngineController: ObservableObject {
 
     // MARK: - Preflight & Monitors
 
-    private func checkInterfaces(_ names: [String]) -> Bool {
-        guard !names.isEmpty else { return true }
+    private func missingInterfaces(in names: [String]) -> [String] {
+        guard !names.isEmpty else { return [] }
         let active = driver.activeInterfaces()
-        let missing = Set(names).subtracting(active)
-        guard missing.isEmpty else {
-            let msg = "绑定网卡缺失或无 IP：\(missing.sorted().joined(separator: "、"))。不会自动换出口。"
-            lastError = msg
-            append(msg + "\n")
-            return false
-        }
-        return true
+        return Set(names).subtracting(active).sorted()
+    }
+
+    private func logMissingInterfacesWarning(_ names: [String]) {
+        let missing = missingInterfaces(in: names)
+        guard !missing.isEmpty else { return }
+        append("提示：绑定网卡暂不可用或无 IP：\(missing.joined(separator: "、"))，核心仍将继续启动并在网卡就绪后使用。\n")
     }
 
     private func checkPorts(_ config: Data, useTun: Bool) -> Bool {
@@ -738,13 +788,20 @@ final class EngineController: ObservableObject {
     private func startInterfaceWatch(_ names: [String], token: UUID) {
         interfaceWatchTask?.cancel()
         interfaceWatchTask = Task { [weak self] in
+            var lastMissing = Set(self?.missingInterfaces(in: names) ?? [])
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 guard !Task.isCancelled, let self, self.generation == token, self.isRunning else { return }
-                if !self.checkInterfaces(names) {
-                    self.stop()
-                    return
+                let currentMissing = Set(self.missingInterfaces(in: names))
+                let recovered = lastMissing.subtracting(currentMissing).sorted()
+                let disappeared = currentMissing.subtracting(lastMissing).sorted()
+                if !recovered.isEmpty {
+                    self.logStore.appendMemoryOnly("检测到绑定网卡已就绪：\(recovered.joined(separator: "、"))。\n")
                 }
+                if !disappeared.isEmpty {
+                    self.logStore.appendMemoryOnly("提示：绑定网卡暂不可用或无 IP：\(disappeared.joined(separator: "、"))，核心将继续运行。\n")
+                }
+                lastMissing = currentMissing
             }
         }
     }

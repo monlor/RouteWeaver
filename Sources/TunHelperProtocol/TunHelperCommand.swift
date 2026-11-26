@@ -6,6 +6,7 @@ public enum TunHelperCommandError: Error, Equatable, Sendable {
     case invalidPid
     case unknownArgument(String)
     case invalidPaths(String)
+    case invalidUpdateArguments(String)
 
     public var message: String {
         switch self {
@@ -16,6 +17,8 @@ public enum TunHelperCommandError: Error, Equatable, Sendable {
         case .unknownArgument(let arg):
             return "RouteWeaverTunHelper: unknown argument \(arg)"
         case .invalidPaths(let detail):
+            return "RouteWeaverTunHelper: \(detail)"
+        case .invalidUpdateArguments(let detail):
             return "RouteWeaverTunHelper: \(detail)"
         }
     }
@@ -44,6 +47,12 @@ public enum TunHelperCommand: Equatable, Sendable {
     case killSwitchDisable
     case killSwitchRestore
     case killSwitchStatus
+    case updateMihomo(
+        downloadURL: String,
+        expectedSHA256: String?,
+        proxyPort: Int?,
+        restartDaemon: Bool
+    )
 
     public var arguments: [String] {
         switch self {
@@ -96,6 +105,18 @@ public enum TunHelperCommand: Equatable, Sendable {
             return ["--killswitch-restore"]
         case .killSwitchStatus:
             return ["--killswitch-status"]
+        case .updateMihomo(let downloadURL, let expectedSHA256, let proxyPort, let restartDaemon):
+            var args = ["--update-mihomo-url", downloadURL]
+            if let expectedSHA256 {
+                args.append(contentsOf: ["--sha256", expectedSHA256.lowercased()])
+            }
+            if let proxyPort {
+                args.append(contentsOf: ["--proxy-port", "\(proxyPort)"])
+            }
+            if restartDaemon {
+                args.append("--restart-daemon")
+            }
+            return args
         }
     }
 
@@ -120,6 +141,10 @@ public enum TunHelperCommand: Equatable, Sendable {
         var killSwitchStatusMode = false
         var killSwitchAllowLAN = false
         var killSwitchPersistOnBoot = false
+        var updateMihomoURL: String?
+        var expectedSHA256: String?
+        var proxyPort: Int?
+        var restartDaemon = false
 
         var i = 0
         while i < args.count {
@@ -177,9 +202,48 @@ public enum TunHelperCommand: Equatable, Sendable {
                 }
                 stopPid = pid_t(parsed)
                 i += 2
+            case "--update-mihomo-url":
+                guard i + 1 < args.count else { throw TunHelperCommandError.missingValue(flag: flag) }
+                updateMihomoURL = args[i + 1]
+                i += 2
+            case "--sha256":
+                guard i + 1 < args.count else { throw TunHelperCommandError.missingValue(flag: flag) }
+                expectedSHA256 = args[i + 1]
+                i += 2
+            case "--proxy-port":
+                guard i + 1 < args.count else { throw TunHelperCommandError.missingValue(flag: flag) }
+                guard let parsed = Int(args[i + 1]), (1...65535).contains(parsed) else {
+                    throw TunHelperCommandError.invalidUpdateArguments("invalid --proxy-port (expected 1...65535)")
+                }
+                proxyPort = parsed
+                i += 2
+            case "--restart-daemon":
+                restartDaemon = true
+                i += 1
             default:
                 throw TunHelperCommandError.unknownArgument(flag)
             }
+        }
+
+        if let updateMihomoURL {
+            guard TunHelperPaths.isTrustedMihomoReleaseURL(updateMihomoURL) else {
+                throw TunHelperCommandError.invalidUpdateArguments("untrusted Mihomo release URL")
+            }
+            let normalizedHash: String?
+            if let expectedSHA256 {
+                guard TunHelperPaths.isValidSHA256Hex(expectedSHA256) else {
+                    throw TunHelperCommandError.invalidUpdateArguments("invalid --sha256 hex digest")
+                }
+                normalizedHash = expectedSHA256.lowercased()
+            } else {
+                normalizedHash = nil
+            }
+            return .updateMihomo(
+                downloadURL: updateMihomoURL,
+                expectedSHA256: normalizedHash,
+                proxyPort: proxyPort,
+                restartDaemon: restartDaemon
+            )
         }
 
         if killSwitchStatusMode { return .killSwitchStatus }

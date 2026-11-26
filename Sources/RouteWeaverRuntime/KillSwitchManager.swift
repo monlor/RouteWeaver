@@ -3,7 +3,7 @@ import TunHelperProtocol
 
 typealias KillSwitchStatus = KillSwitchStatusReport
 
-enum KillSwitchError: LocalizedError {
+enum KillSwitchError: LocalizedError, Equatable {
     case helperNotAuthorized
     case helperOutdated
     case failed(String)
@@ -21,31 +21,30 @@ enum KillSwitchError: LocalizedError {
 }
 
 enum KillSwitchManager {
-    static func queryStatusAsync() async -> KillSwitchStatus {
+    static func queryStatusAsync(client: PrivilegedHelperClient = .live) async -> KillSwitchStatus {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: queryStatusSync())
+                continuation.resume(returning: queryStatusSync(client: client))
             }
         }
     }
 
-    static func queryStatusSync() -> KillSwitchStatus {
-        let helperURL = TunHelperManager.installedHelperURL
-        guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
-            return .inactive
-        }
-        let result = runHelper(TunHelperCommand.killSwitchStatus.arguments)
-        guard result.status == 0 else {
+    static func queryStatusSync(client: PrivilegedHelperClient = .live) -> KillSwitchStatus {
+        guard let result = try? client.execute(.killSwitchStatus) else {
             return .inactive
         }
         return KillSwitchStatusReport.parse(result.output)
     }
 
-    static func enableAsync(allowLAN: Bool, persistOnBoot: Bool) async throws -> KillSwitchStatus {
+    static func enableAsync(
+        allowLAN: Bool,
+        persistOnBoot: Bool,
+        client: PrivilegedHelperClient = .live
+    ) async throws -> KillSwitchStatus {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let status = try enableSync(allowLAN: allowLAN, persistOnBoot: persistOnBoot)
+                    let status = try enableSync(allowLAN: allowLAN, persistOnBoot: persistOnBoot, client: client)
                     continuation.resume(returning: status)
                 } catch {
                     continuation.resume(throwing: error)
@@ -54,11 +53,11 @@ enum KillSwitchManager {
         }
     }
 
-    static func disableAsync() async throws -> KillSwitchStatus {
+    static func disableAsync(client: PrivilegedHelperClient = .live) async throws -> KillSwitchStatus {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let status = try disableSync()
+                    let status = try disableSync(client: client)
                     continuation.resume(returning: status)
                 } catch {
                     continuation.resume(throwing: error)
@@ -67,55 +66,39 @@ enum KillSwitchManager {
         }
     }
 
-    static func enableSync(allowLAN: Bool, persistOnBoot: Bool) throws -> KillSwitchStatus {
-        let helperURL = TunHelperManager.installedHelperURL
-        guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
-            throw KillSwitchError.helperNotAuthorized
+    static func enableSync(
+        allowLAN: Bool,
+        persistOnBoot: Bool,
+        client: PrivilegedHelperClient = .live
+    ) throws -> KillSwitchStatus {
+        do {
+            _ = try client.execute(.killSwitchEnable(allowLAN: allowLAN, persistOnBoot: persistOnBoot))
+        } catch let error as PrivilegedHelperError {
+            throw mapHelperError(error)
         }
-        let cmd = TunHelperCommand.killSwitchEnable(allowLAN: allowLAN, persistOnBoot: persistOnBoot)
-        let result = runHelper(cmd.arguments)
-        if result.status != 0 {
-            if result.output.contains("unknown argument") {
-                throw KillSwitchError.helperOutdated
-            }
-            let detail = result.output.isEmpty ? "退出码 \(result.status)" : result.output
-            throw KillSwitchError.failed(detail)
-        }
-        return queryStatusSync()
+        return queryStatusSync(client: client)
     }
 
-    static func disableSync() throws -> KillSwitchStatus {
-        let helperURL = TunHelperManager.installedHelperURL
-        guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
+    static func disableSync(client: PrivilegedHelperClient = .live) throws -> KillSwitchStatus {
+        guard client.isHelperInstalled else {
             return .inactive
         }
-        let result = runHelper(TunHelperCommand.killSwitchDisable.arguments)
-        if result.status != 0 {
-            if result.output.contains("unknown argument") {
-                throw KillSwitchError.helperOutdated
-            }
-            let detail = result.output.isEmpty ? "退出码 \(result.status)" : result.output
-            throw KillSwitchError.failed(detail)
+        do {
+            _ = try client.execute(.killSwitchDisable)
+        } catch let error as PrivilegedHelperError {
+            throw mapHelperError(error)
         }
-        return queryStatusSync()
+        return queryStatusSync(client: client)
     }
 
-    private static func runHelper(_ arguments: [String]) -> (status: Int32, output: String) {
-        let proc = Process()
-        let pipe = Pipe()
-        proc.executableURL = TunHelperManager.installedHelperURL
-        proc.arguments = arguments
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-        do {
-            try proc.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            return (proc.terminationStatus, text)
-        } catch {
-            return (-1, error.localizedDescription)
+    private static func mapHelperError(_ error: PrivilegedHelperError) -> KillSwitchError {
+        switch error {
+        case .helperMissing:
+            return .helperNotAuthorized
+        case .helperOutdated:
+            return .helperOutdated
+        case .executionFailed(_, let detail):
+            return .failed(detail)
         }
     }
 }

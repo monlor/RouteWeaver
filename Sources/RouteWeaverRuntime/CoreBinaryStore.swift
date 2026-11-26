@@ -1,9 +1,11 @@
 import Combine
 import Foundation
 import RoutingCore
+import TunHelperProtocol
 
 enum CoreBinarySource: Equatable, Sendable {
     case managed
+    case authorized
     case bundled
     case system
     case none
@@ -11,6 +13,7 @@ enum CoreBinarySource: Equatable, Sendable {
     var title: String {
         switch self {
         case .managed: return "已更新内核"
+        case .authorized: return "受信任内核"
         case .bundled: return "内置内核"
         case .system: return "系统内核"
         case .none: return "未安装"
@@ -97,6 +100,12 @@ final class CoreBinaryStore: ObservableObject {
         updateMessage = "新内核已就绪，点击「启动核心」即可生效。"
     }
 
+    func setBinaryForTesting(_ url: URL?, source: CoreBinarySource = .bundled, version: String? = "v1.19.27") {
+        self.binary = url
+        self.source = url == nil ? .none : source
+        self.version = version
+    }
+
     func resetToBundled(onSuccess: () -> Void) {
         do {
             try Self.removeManagedBinary()
@@ -139,6 +148,7 @@ final class CoreBinaryStore: ObservableObject {
     func installUpdate(
         proxyPort: Int?,
         isEngineRunning: @escaping @MainActor () -> Bool,
+        isTunDaemonRunning: @escaping @MainActor () -> Bool = { false },
         onInstalled: @escaping @MainActor (String) -> Void
     ) {
         guard !isUpdating else { return }
@@ -160,7 +170,49 @@ final class CoreBinaryStore: ObservableObject {
                     asset = fetchedAsset
                 }
 
+                let rawURL = asset.downloadURL.absoluteString
+                let canUsePrivilegedHelper = await Task.detached(priority: .userInitiated) {
+                    TunHelperManager.canSelfUpdateMihomo() && TunHelperPaths.isTrustedMihomoReleaseURL(rawURL)
+                }.value
+
+                if canUsePrivilegedHelper {
+                    self.updateMessage = "正在通过受信任守护组件免密更新 Mihomo 内核…"
+                    let restartDaemon = isTunDaemonRunning()
+                    let helperVer = try await TunHelperManager.updateMihomoViaHelper(
+                        downloadURL: rawURL,
+                        expectedSHA256: asset.sha256,
+                        proxyPort: proxyPort,
+                        restartDaemon: restartDaemon
+                    )
+                    Self.syncAuthorizedBinaryToManagedIfPossible()
+                    TunHelperManager.invalidateMetadataCache()
+                    let resolvedVer: String
+                    if let helperVer {
+                        resolvedVer = helperVer
+                    } else if let readVer = await Self.readVersion(of: TunHelperPaths.installedMihomoURL) {
+                        resolvedVer = readVer
+                    } else {
+                        resolvedVer = self.latestRelease?.tagName ?? "最新版"
+                    }
+                    self.refresh()
+                    self.version = resolvedVer
+
+                    if restartDaemon {
+                        self.pendingRestart = false
+                        self.updateMessage = "已免密更新至 Mihomo \(resolvedVer) 并无缝热重启网关核心。"
+                    } else if isEngineRunning() {
+                        self.pendingRestart = true
+                        self.updateMessage = "已免密同步 Mihomo \(resolvedVer)，停止并重新启动核心后生效（无需输入密码）。"
+                    } else {
+                        self.pendingRestart = false
+                        self.updateMessage = "已免密更新至 Mihomo \(resolvedVer)。"
+                    }
+                    onInstalled(resolvedVer)
+                    return
+                }
+
                 let (_, installedVersion) = try await Self.installUpdateAsset(asset, proxyPort: proxyPort)
+                TunHelperManager.invalidateMetadataCache()
                 self.refresh()
                 self.version = installedVersion
 
@@ -211,16 +263,67 @@ final class CoreBinaryStore: ObservableObject {
 
     private nonisolated static func resolveBinary() -> (url: URL?, source: CoreBinarySource) {
         let fm = FileManager.default
+        var candidates: [(url: URL, source: CoreBinarySource, priority: Int)] = []
         if fm.isExecutableFile(atPath: managedBinaryURL.path) {
-            return (managedBinaryURL, .managed)
+            candidates.append((managedBinaryURL, .managed, 3))
+        }
+        if fm.isExecutableFile(atPath: TunHelperPaths.installedMihomoURL.path) {
+            candidates.append((TunHelperPaths.installedMihomoURL, .authorized, 2))
         }
         if let bundled = bundledBinaryURL, fm.isExecutableFile(atPath: bundled.path) {
-            return (bundled, .bundled)
+            candidates.append((bundled, .bundled, 1))
+        }
+
+        if let best = selectNewestCandidate(candidates) {
+            return (best.url, best.source)
         }
         if let system = systemBinaryURLs.first {
             return (system, .system)
         }
         return (nil, .none)
+    }
+
+    private nonisolated static func selectNewestCandidate(
+        _ candidates: [(url: URL, source: CoreBinarySource, priority: Int)]
+    ) -> (url: URL, source: CoreBinarySource, priority: Int)? {
+        guard var best = candidates.first else { return nil }
+        guard candidates.count > 1 else { return best }
+        var bestVer = TunHelperManager.cachedMihomoVersion(at: best.url)
+
+        for candidate in candidates.dropFirst() {
+            let candVer = TunHelperManager.cachedMihomoVersion(at: candidate.url)
+            if let b = bestVer, let c = candVer {
+                let cmp = MihomoConfig.compareVersions(b, c)
+                if cmp == .orderedAscending || (cmp == .orderedSame && candidate.priority > best.priority) {
+                    best = candidate
+                    bestVer = candVer
+                }
+            } else if bestVer == nil && candVer != nil {
+                best = candidate
+                bestVer = candVer
+            }
+        }
+        return best
+    }
+
+    private nonisolated static func syncAuthorizedBinaryToManagedIfPossible() {
+        let fm = FileManager.default
+        let authURL = TunHelperPaths.installedMihomoURL
+        guard fm.isExecutableFile(atPath: authURL.path) else { return }
+        do {
+            try fm.createDirectory(at: managedDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let stagingURL = managedDirectory.appendingPathComponent("mihomo.sync-\(UUID().uuidString)")
+            defer { try? fm.removeItem(at: stagingURL) }
+            try fm.copyItem(at: authURL, to: stagingURL)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stagingURL.path)
+            if fm.fileExists(atPath: managedBinaryURL.path) {
+                _ = try fm.replaceItemAt(managedBinaryURL, withItemAt: stagingURL)
+            } else {
+                try fm.moveItem(at: stagingURL, to: managedBinaryURL)
+            }
+        } catch {
+            // Best-effort user copy; authorized root copy is already updated.
+        }
     }
 
     private nonisolated static func readVersion(of binary: URL) async -> String? {
@@ -251,6 +354,7 @@ final class CoreBinaryStore: ObservableObject {
             let name: String
             let browser_download_url: String
             let size: Int64?
+            let digest: String?
         }
         struct RawRelease: Decodable {
             let tag_name: String
@@ -267,7 +371,12 @@ final class CoreBinaryStore: ObservableObject {
             guard let url = URL(string: raw.browser_download_url), url.scheme?.lowercased() == "https" else {
                 return nil
             }
-            return MihomoReleaseAsset(name: raw.name, downloadURL: url, size: raw.size ?? 0)
+            return MihomoReleaseAsset(
+                name: raw.name,
+                downloadURL: url,
+                size: raw.size ?? 0,
+                sha256: MihomoReleaseAsset.parseGitHubDigest(raw.digest)
+            )
         }
 
         let release = MihomoRelease(

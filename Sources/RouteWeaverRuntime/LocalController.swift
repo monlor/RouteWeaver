@@ -20,6 +20,7 @@ protocol MihomoControlClient: Sendable {
     func flushFakeIPCache() async throws
     func connectionSnapshots() -> AsyncThrowingStream<MihomoConnectionsSnapshot, Error>
     func dnsLogRecords(level: String) -> AsyncThrowingStream<DNSLogRecord, Error>
+    func logEvents(level: String) -> AsyncThrowingStream<MihomoLogStreamEvent, Error>
 }
 
 extension MihomoControlClient {
@@ -33,6 +34,25 @@ extension MihomoControlClient {
 
     func dnsLogRecords() -> AsyncThrowingStream<DNSLogRecord, Error> {
         dnsLogRecords(level: "debug")
+    }
+
+    func logEvents(level: String = "debug") -> AsyncThrowingStream<MihomoLogStreamEvent, Error> {
+        let upstream = dnsLogRecords(level: level)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await record in upstream {
+                        continuation.yield(.dns(record))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
     }
 }
 
@@ -54,6 +74,21 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
         let now: String
         let all: [String]
         let delays: [String: Int]
+        let timedOutNodes: Set<String>
+
+        init(
+            type: String,
+            now: String,
+            all: [String],
+            delays: [String: Int],
+            timedOutNodes: Set<String> = []
+        ) {
+            self.type = type
+            self.now = now
+            self.all = all
+            self.delays = delays
+            self.timedOutNodes = timedOutNodes
+        }
 
         var isAutoTest: Bool {
             let lower = type.lowercased()
@@ -63,6 +98,11 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
         var currentDelay: Int? {
             guard !now.isEmpty else { return nil }
             return delays[now]
+        }
+
+        var isCurrentNodeTimedOut: Bool {
+            guard !now.isEmpty else { return false }
+            return timedOutNodes.contains(now)
         }
     }
 
@@ -74,30 +114,40 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
         let history: [DelayHistoryEntry]?
     }
 
+    private enum ProbeState {
+        case delay(Int)
+        case timedOut
+        case untested
+    }
+
     private struct GroupResponse: Decodable {
         let name: String?
         let type: String?
         let now: String?
         let all: [String]?
+        let alive: Bool?
         let history: [DelayHistoryEntry]?
         let extra: [String: DelayExtraEntry]?
 
-        var latestDelay: Int? {
+        var latestProbe: ProbeState {
             if let extraHistory = extra?[MihomoConfig.healthCheckURL]?.history,
-               let delay = extraHistory.last(where: { ($0.delay ?? 0) > 0 })?.delay {
-                return delay
+               let last = extraHistory.last, let d = last.delay {
+                return d > 0 ? .delay(d) : .timedOut
             }
             if let extra {
                 for entry in extra.values {
-                    if let delay = entry.history?.last(where: { ($0.delay ?? 0) > 0 })?.delay {
-                        return delay
+                    if let last = entry.history?.last, let d = last.delay {
+                        return d > 0 ? .delay(d) : .timedOut
                     }
                 }
             }
-            if let delay = history?.last(where: { ($0.delay ?? 0) > 0 })?.delay {
-                return delay
+            if let last = history?.last, let d = last.delay {
+                return d > 0 ? .delay(d) : .timedOut
             }
-            return nil
+            if alive == false {
+                return .timedOut
+            }
+            return .untested
         }
     }
 
@@ -149,17 +199,33 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
         let response = try JSONDecoder().decode(ProxyResponse.self, from: data)
 
         var delayByNode: [String: Int] = [:]
+        var timedOutSet = Set<String>()
         for (nodeName, info) in response.proxies {
-            if let delay = info.latestDelay {
+            switch info.latestProbe {
+            case .delay(let delay):
                 delayByNode[nodeName] = delay
+                timedOutSet.remove(nodeName)
+            case .timedOut:
+                timedOutSet.insert(nodeName)
+            case .untested:
+                break
             }
         }
         if let providersData = await providersDataTask,
            let providersResp = try? JSONDecoder().decode(ProxyProvidersResponse.self, from: providersData) {
             for provider in providersResp.providers.values {
                 for node in provider.proxies ?? [] {
-                    if let name = node.name, let delay = node.latestDelay {
+                    guard let name = node.name else { continue }
+                    switch node.latestProbe {
+                    case .delay(let delay):
                         delayByNode[name] = delay
+                        timedOutSet.remove(name)
+                    case .timedOut:
+                        if delayByNode[name] == nil {
+                            timedOutSet.insert(name)
+                        }
+                    case .untested:
+                        break
                     }
                 }
             }
@@ -171,16 +237,20 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
                 var seen = Set<String>()
                 let uniqueNodes = nodes.filter { seen.insert($0).inserted }
                 var delays: [String: Int] = [:]
+                var groupTimedOut = Set<String>()
                 for nodeName in uniqueNodes {
                     if let delay = delayByNode[nodeName] {
                         delays[nodeName] = delay
+                    } else if timedOutSet.contains(nodeName) {
+                        groupTimedOut.insert(nodeName)
                     }
                 }
                 groups[name] = ProxyGroup(
                     type: group.type ?? "Selector",
                     now: group.now ?? "",
                     all: uniqueNodes,
-                    delays: delays
+                    delays: delays,
+                    timedOutNodes: groupTimedOut
                 )
             }
         }
@@ -279,6 +349,22 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
                 return nil
             }
             return DNSLogParser.parse(payload: payload)
+        }
+    }
+
+    func logEvents(level: String = "debug") -> AsyncThrowingStream<MihomoLogStreamEvent, Error> {
+        webSocketStream(path: "/logs", queryItems: [URLQueryItem(name: "level", value: level)], idleTimeout: 60) { data in
+            guard let envelope = try? JSONDecoder().decode(MihomoLogEnvelope.self, from: data),
+                  let payload = envelope.payload else {
+                return nil
+            }
+            if let dnsRecord = DNSLogParser.parse(payload: payload) {
+                return .dns(dnsRecord)
+            }
+            if let outboundErr = OutboundErrorParser.parse(payload: payload, level: envelope.type) {
+                return .outboundError(outboundErr)
+            }
+            return nil
         }
     }
 
@@ -498,7 +584,7 @@ struct LocalController: Equatable, Sendable, MihomoControlClient {
         return data
     }
 
-    private enum ControllerError: LocalizedError {
+    enum ControllerError: LocalizedError, Equatable {
         case invalidAddress, invalidGroup, streamTimedOut, http(Int)
 
         var errorDescription: String? {

@@ -7,7 +7,7 @@ struct LaunchdJobStatus: Equatable, Sendable {
     let pid: pid_t?
 }
 
-enum LaunchdServiceError: LocalizedError {
+enum LaunchdServiceError: LocalizedError, Equatable {
     case helperMissing
     case failed(String)
 
@@ -50,9 +50,10 @@ enum LaunchdServiceManager {
         binary: URL,
         workDir: URL,
         configPath: URL,
-        logFile: URL
+        logFile: URL,
+        client: PrivilegedHelperClient = .live
     ) throws {
-        _ = runLaunchctl(["bootout", userServiceTarget])
+        _ = client.runLaunchctl(["bootout", userServiceTarget])
 
         let data = try TunHelperPlists.userAgentPlistData(
             binaryPath: binary.path,
@@ -64,31 +65,30 @@ enum LaunchdServiceManager {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try data.write(to: userAgentPlistURL, options: .atomic)
 
-        let result = runLaunchctl(["bootstrap", userDomainTarget, userAgentPlistURL.path])
-        if result.status != 0 {
+        let result = client.runLaunchctl(["bootstrap", userDomainTarget, userAgentPlistURL.path])
+        if !result.isSuccess {
             try? FileManager.default.removeItem(at: userAgentPlistURL)
-            let detail = result.output.isEmpty ? "退出码 \(result.status)" : result.output
-            throw LaunchdServiceError.failed("无法注册 LaunchAgent 系统级保活服务：\(detail)")
+            throw LaunchdServiceError.failed("无法注册 LaunchAgent 系统级保活服务：\(result.failureDetail)")
         }
     }
 
-    static func stopUserAgentSync() {
-        _ = runLaunchctl(["bootout", userServiceTarget])
+    static func stopUserAgentSync(client: PrivilegedHelperClient = .live) {
+        _ = client.runLaunchctl(["bootout", userServiceTarget])
         try? FileManager.default.removeItem(at: userAgentPlistURL)
     }
 
-    static func stopUserAgentAsync() async {
+    static func stopUserAgentAsync(client: PrivilegedHelperClient = .live) async {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                stopUserAgentSync()
+                stopUserAgentSync(client: client)
                 continuation.resume()
             }
         }
     }
 
-    static func queryUserAgentStatus() -> LaunchdJobStatus {
-        let result = runLaunchctl(["print", userServiceTarget])
-        guard result.status == 0 else {
+    static func queryUserAgentStatus(client: PrivilegedHelperClient = .live) -> LaunchdJobStatus {
+        let result = client.runLaunchctl(["print", userServiceTarget])
+        guard result.isSuccess else {
             return LaunchdJobStatus(isLoaded: false, pid: nil)
         }
         return LaunchdJobStatus(isLoaded: true, pid: parsePid(fromLaunchctlPrint: result.output))
@@ -101,13 +101,9 @@ enum LaunchdServiceManager {
         configPath: URL,
         logFile: URL,
         pidFile: URL,
-        useGateway: Bool
+        useGateway: Bool,
+        client: PrivilegedHelperClient = .live
     ) throws {
-        let helperURL = TunHelperManager.installedHelperURL
-        guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
-            throw LaunchdServiceError.helperMissing
-        }
-
         let cmd = TunHelperCommand.installDaemon(
             workDir: workDir.path,
             configPath: configPath.path,
@@ -115,65 +111,41 @@ enum LaunchdServiceManager {
             pidFilePath: pidFile.path,
             gatewayMode: useGateway
         )
-        let result = runExecutable(helperURL, arguments: cmd.arguments)
-        if result.status != 0 {
-            let detail = result.output.isEmpty ? "退出码 \(result.status)" : result.output
+        do {
+            _ = try client.execute(cmd)
+        } catch PrivilegedHelperError.helperMissing {
+            throw LaunchdServiceError.helperMissing
+        } catch PrivilegedHelperError.helperOutdated {
+            throw LaunchdServiceError.failed("无法注册 TUN LaunchDaemon 系统级保活服务：已安装的辅助组件版本较旧，请重新授权")
+        } catch PrivilegedHelperError.executionFailed(_, let detail) {
             throw LaunchdServiceError.failed("无法注册 TUN LaunchDaemon 系统级保活服务：\(detail)")
         }
     }
 
-    static func stopTunDaemonSync() -> Bool {
-        let helperURL = TunHelperManager.installedHelperURL
-        guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
-            return false
-        }
-        let result = runExecutable(helperURL, arguments: TunHelperCommand.uninstallDaemon.arguments)
-        return result.status == 0
+    static func stopTunDaemonSync(client: PrivilegedHelperClient = .live) -> Bool {
+        (try? client.execute(.uninstallDaemon)) != nil
     }
 
-    static func stopTunDaemonAsync() async -> Bool {
+    static func stopTunDaemonAsync(client: PrivilegedHelperClient = .live) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let ok = stopTunDaemonSync()
+                let ok = stopTunDaemonSync(client: client)
                 continuation.resume(returning: ok)
             }
         }
     }
 
-    static func queryTunDaemonStatus() -> LaunchdJobStatus {
-        let result = runLaunchctl(["print", tunServiceTarget])
-        guard result.status == 0 else {
+    static func queryTunDaemonStatus(client: PrivilegedHelperClient = .live) -> LaunchdJobStatus {
+        let result = client.runLaunchctl(["print", tunServiceTarget])
+        guard result.isSuccess else {
             return LaunchdJobStatus(isLoaded: false, pid: nil)
         }
         return LaunchdJobStatus(isLoaded: true, pid: parsePid(fromLaunchctlPrint: result.output))
     }
 
-    // MARK: - Parsing & Subprocess Helpers
+    // MARK: - Parsing
 
     static func parsePid(fromLaunchctlPrint output: String) -> pid_t? {
         ProcessInspector.parseLaunchctlPid(from: output)
-    }
-
-    private static func runLaunchctl(_ arguments: [String]) -> (status: Int32, output: String) {
-        runExecutable(URL(fileURLWithPath: "/bin/launchctl"), arguments: arguments)
-    }
-
-    private static func runExecutable(_ executable: URL, arguments: [String]) -> (status: Int32, output: String) {
-        let proc = Process()
-        let pipe = Pipe()
-        proc.executableURL = executable
-        proc.arguments = arguments
-        proc.standardInput = FileHandle.nullDevice
-        proc.standardOutput = pipe
-        proc.standardError = pipe
-        do {
-            try proc.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            return (proc.terminationStatus, text)
-        } catch {
-            return (-1, error.localizedDescription)
-        }
     }
 }
