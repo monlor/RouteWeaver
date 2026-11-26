@@ -6,7 +6,7 @@
       "autoClose": false,
       "command": "./Scripts/install-app.sh",
       "id": "install-app",
-      "label": "安装到 Mac",
+      "label": "部署到 Mac mini",
       "prompt": null,
       "type": "command",
       "workflowId": null
@@ -45,6 +45,32 @@
           "-lc",
           "pkill -TERM -f \"$PWD/dist/RouteWeaver.app/Contents/MacOS/RouteWeaver\" || true; for i in $(seq 1 20); do pgrep -f \"$PWD/dist/RouteWeaver.app/Contents/MacOS/RouteWeaver\" >/dev/null || exit 0; sleep 0.1; done; pkill -KILL -f \"$PWD/dist/RouteWeaver.app/Contents/MacOS/RouteWeaver\" || true"
         ]
+      },
+      {
+        "bundleId": "com.bytevela.routeweaver",
+        "command": [
+          "bash",
+          "-lc",
+          "./iOS/Scripts/build-ios-sim.sh"
+        ],
+        "cwd": ".",
+        "defaultPath": null,
+        "dependsOn": [],
+        "device": "iPhone 18 Pro",
+        "env": {},
+        "healthPath": "/health",
+        "id": "routeweaver-ios",
+        "kind": "ios-simulator",
+        "name": "RouteWeaver iOS",
+        "port": {
+          "args": [],
+          "env": null,
+          "fixed": null
+        },
+        "preferredPort": null,
+        "readyTimeoutMs": 180000,
+        "route": "direct",
+        "source": "configured"
       }
     ],
     "version": 1

@@ -132,13 +132,16 @@ print(pick(assets))
   gzip -dc "$tmp_gz" > "$cached_bin.tmp"
   rm -f "$tmp_gz"
   chmod 0755 "$cached_bin.tmp"
+  codesign --force --sign - "$cached_bin.tmp"
   mv "$cached_bin.tmp" "$cached_bin"
   echo "$cached_bin"
 }
 
 if BUNDLED_MIHOMO="$(resolve_mihomo)"; then
   install -m 0755 "$BUNDLED_MIHOMO" "$APP/Contents/Resources/bin/mihomo"
-  codesign --force --sign - "$APP/Contents/Resources/bin/mihomo"
+  if ! codesign --verify --strict "$APP/Contents/Resources/bin/mihomo" >/dev/null 2>&1; then
+    codesign --force --sign - "$APP/Contents/Resources/bin/mihomo"
+  fi
   echo "Bundled Mihomo: $BUNDLED_MIHOMO"
 else
   echo "Warning: Mihomo binary not bundled (offline or unavailable). Users can update in-app." >&2
@@ -274,6 +277,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocalNetworkUsageDescription</key><string>RouteWeaver 需要访问局域网以发现并配对局域网内的其他 RouteWeaver 设备进行远程管理。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_routeweaver._tcp</string>
+    </array>
 </dict>
 </plist>
 PLIST

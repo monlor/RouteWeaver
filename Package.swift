@@ -21,7 +21,7 @@ targets.append(.executableTarget(name: "RouteWeaverTunHelper", dependencies: ["T
 
 let package = Package(
     name: "RouteWeaver",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v13), .iOS(.v16)],
     products: products,
     targets: targets
 )
