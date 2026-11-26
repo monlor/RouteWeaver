@@ -177,6 +177,7 @@ struct DNSLogInspectorView: View {
                 }
             }
             .padding(16)
+            .lockScrollDocumentWidth()
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
     }

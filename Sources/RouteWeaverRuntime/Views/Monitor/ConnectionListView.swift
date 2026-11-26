@@ -7,8 +7,17 @@ struct ConnectionListView: View {
     let rows: [MonitoredConnection]
     let ruleIndex: RuleMatchDisplayIndex
     @Binding var selectedConnectionID: String?
+    var availableWidth: CGFloat = 720
     let resolveRelayChain: (MonitoredConnection) -> ResolvedRelayChain?
     let onResetFilters: () -> Void
+
+    private var exitColumnWidth: CGFloat {
+        availableWidth < 600 ? 150 : 210
+    }
+
+    private var trafficColumnWidth: CGFloat {
+        availableWidth < 600 ? 96 : 112
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -37,12 +46,15 @@ struct ConnectionListView: View {
             Text("目标 / 规则")
                 .frame(maxWidth: .infinity, alignment: .leading)
             Text("出口链路")
-                .frame(width: 215, alignment: .leading)
+                .frame(width: exitColumnWidth, alignment: .leading)
             Text("流量 (↑ / ↓)")
-                .frame(width: 112, alignment: .trailing)
-            Text("时长")
-                .frame(width: 58, alignment: .trailing)
+                .frame(width: trafficColumnWidth, alignment: .trailing)
+            if availableWidth >= 540 {
+                Text("时长")
+                    .frame(width: 54, alignment: .trailing)
+            }
         }
+        .lineLimit(1)
         .font(.caption.weight(.medium))
         .foregroundStyle(.secondary)
         .padding(.horizontal, 16)
@@ -74,6 +86,21 @@ struct ConnectionListView: View {
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
                             .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.12)))
+
+                        if let clientLabel = state.connectionLANClientLabel(for: item) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "laptopcomputer")
+                                    .font(.system(size: 8.5))
+                                Text(clientLabel)
+                                    .lineLimit(1)
+                            }
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(RoundedRectangle(cornerRadius: 4).fill(Color.blue.opacity(0.12)))
+                            .help("来源局域网设备：\(state.clientDisplayLabel(for: state.connectionClientKey(for: item)))")
+                        }
 
                         if !item.processDisplayName.isEmpty {
                             Text(item.processDisplayName)
@@ -156,7 +183,7 @@ struct ConnectionListView: View {
                         .truncationMode(.tail)
                 }
             }
-            .frame(width: 215, alignment: .leading)
+            .frame(width: exitColumnWidth, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 2) {
                 HStack(spacing: 3) {
@@ -165,6 +192,7 @@ struct ConnectionListView: View {
                     Text(TrafficFormatter.bytes(item.upload))
                         .foregroundStyle(.secondary)
                 }
+                .lineLimit(1)
                 .font(.system(.caption2, design: .monospaced))
 
                 HStack(spacing: 3) {
@@ -173,14 +201,18 @@ struct ConnectionListView: View {
                     Text(TrafficFormatter.bytes(item.download))
                         .foregroundStyle(item.isActive ? .primary : .secondary)
                 }
+                .lineLimit(1)
                 .font(.system(.caption2, design: .monospaced))
             }
-            .frame(width: 112, alignment: .trailing)
+            .frame(width: trafficColumnWidth, alignment: .trailing)
 
-            Text(TrafficFormatter.duration(item.duration()))
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .frame(width: 58, alignment: .trailing)
+            if availableWidth >= 540 {
+                Text(TrafficFormatter.duration(item.duration()))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .frame(width: 54, alignment: .trailing)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -201,6 +233,11 @@ struct ConnectionListView: View {
                     state.copyText(item.metadata.destinationIP.isEmpty ? item.metadata.remoteDestination : item.metadata.destinationIP, label: "目标 IP")
                 }
             }
+            if !item.metadata.sourceIP.isEmpty {
+                Button("复制来源设备 IP (\(item.metadata.sourceIP))") {
+                    state.copyText(item.metadata.sourceIP, label: "来源设备 IP \(item.metadata.sourceIP)")
+                }
+            }
             if !item.processDisplayName.isEmpty {
                 Button("复制进程名") {
                     state.copyText(item.processDisplayName, label: "进程名 \(item.processDisplayName)")
@@ -210,7 +247,7 @@ struct ConnectionListView: View {
             Button("复制完整请求摘要") {
                 state.copyText(item.exportSummary(), label: "请求摘要")
             }
-            if item.isActive && state.engine.isRunning {
+            if item.isActive && state.isCoreRunning {
                 Divider()
                 Button("断开此连接", role: .destructive) {
                     state.closeMonitoredConnection(id: item.id)

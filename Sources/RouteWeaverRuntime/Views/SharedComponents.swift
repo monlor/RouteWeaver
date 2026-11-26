@@ -20,11 +20,19 @@ struct SectionCard<Content: View, Trailing: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
+            if Trailing.self == EmptyView.self {
                 Label(title, systemImage: icon)
                     .font(.headline)
-                Spacer()
-                trailing()
+                    .lineLimit(1)
+            } else {
+                SplitHeaderBar(horizontalSpacing: 10, verticalSpacing: 8) {
+                    Label(title, systemImage: icon)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                } trailing: {
+                    trailing()
+                }
             }
             content()
         }
@@ -57,24 +65,42 @@ struct FormRow<Content: View>: View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text(title)
                 .foregroundStyle(.primary)
+                .lineLimit(2)
                 .frame(width: labelWidth, alignment: .leading)
             content()
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
+/// Atomic status pill with built-in single-line anti-squashing invariants so pills can never
+/// deform into vertical single-character columns under tight `HStack` proposals.
 struct StatusPill: View {
     let text: String
     let systemImage: String?
     let color: Color
+    var maxWidth: CGFloat?
 
-    init(_ text: String, systemImage: String? = nil, color: Color) {
+    init(_ text: String, systemImage: String? = nil, color: Color, maxWidth: CGFloat? = nil) {
         self.text = text
         self.systemImage = systemImage
         self.color = color
+        self.maxWidth = maxWidth
     }
 
     var body: some View {
+        Group {
+            if let maxWidth {
+                pillLabel
+                    .frame(maxWidth: maxWidth, alignment: .leading)
+            } else {
+                pillLabel
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+    }
+
+    private var pillLabel: some View {
         Group {
             if let systemImage {
                 Label(text, systemImage: systemImage)
@@ -84,9 +110,38 @@ struct StatusPill: View {
         }
         .font(.caption.weight(.medium))
         .foregroundStyle(color)
+        .lineLimit(1)
+        .truncationMode(.tail)
         .padding(.horizontal, 9)
         .padding(.vertical, 3.5)
         .background(Capsule().fill(color.opacity(0.12)))
+    }
+}
+
+/// Atomic single-line monospaced metric readout (speeds, byte counts, active connection counts)
+/// guaranteed never to wrap character-by-character vertically.
+struct MonospacedMetricText: View {
+    let text: String
+    var color: Color = .secondary
+    var font: Font = .system(.caption, design: .monospaced).weight(.medium)
+
+    init(
+        _ text: String,
+        color: Color = .secondary,
+        font: Font = .system(.caption, design: .monospaced).weight(.medium)
+    ) {
+        self.text = text
+        self.color = color
+        self.font = font
+    }
+
+    var body: some View {
+        Text(text)
+            .font(font)
+            .monospacedDigit()
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
     }
 }
 
@@ -96,23 +151,25 @@ struct ChainFlowBadge: View {
     var aliasStepCount: Int = 0
 
     var body: some View {
-        HStack(spacing: 6) {
+        FlowLayout(horizontalSpacing: 6, verticalSpacing: 5) {
             ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
                 if index > 0 {
                     Image(systemName: "arrow.right")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.tertiary)
+                        .padding(.vertical, 4)
                 }
                 Text(step)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(color(for: index))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .fill(color(for: index).opacity(0.11))
                     )
-                    .lineLimit(1)
             }
         }
     }

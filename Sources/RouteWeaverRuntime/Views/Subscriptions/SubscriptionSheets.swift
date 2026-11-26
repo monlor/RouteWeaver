@@ -9,6 +9,10 @@ struct SubscriptionNodesSheet: View {
 
     @State private var searchText = ""
 
+    private var cacheEntry: SubscriptionNodeCacheEntry? {
+        subscriptionStore.cache[subscription.id]
+    }
+
     private var allNodes: [SubscriptionNode] {
         state.nodes(forSubscriptionID: subscription.id)
     }
@@ -28,7 +32,8 @@ struct SubscriptionNodesSheet: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("订阅节点列表 · \(subscription.name)").font(.headline)
-                    Text("共 \(allNodes.count) 个节点\(searchText.isEmpty ? "" : "，筛选出 \(filteredNodes.count) 个")")
+                    let displayTotal = allNodes.isEmpty ? (cacheEntry?.effectiveNodeCount ?? 0) : allNodes.count
+                    Text("共 \(displayTotal) 个节点\(searchText.isEmpty ? "" : "，筛选出 \(filteredNodes.count) 个")")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -63,7 +68,16 @@ struct SubscriptionNodesSheet: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if filteredNodes.isEmpty {
-                InlineNote(allNodes.isEmpty ? "暂无节点，请点击「重新拉取」。" : "没有匹配当前搜索条件的节点。")
+                let emptyHint: String = {
+                    if allNodes.isEmpty {
+                        if let entry = cacheEntry, !entry.hasNodeDetails, entry.effectiveNodeCount > 0 {
+                            return "远端共 \(entry.effectiveNodeCount) 个节点，暂未同步到节点明细，请点击右上角「重新拉取」或更新远端 RouteWeaver。"
+                        }
+                        return "暂无节点，请点击「重新拉取」。"
+                    }
+                    return "没有匹配当前搜索条件的节点。"
+                }()
+                InlineNote(emptyHint)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else {
                 List(filteredNodes) { node in

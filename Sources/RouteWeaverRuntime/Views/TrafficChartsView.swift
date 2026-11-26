@@ -445,8 +445,8 @@ struct TrafficOverviewCard: View {
         if samples.count < 2 {
             emptyChartPlaceholder(
                 icon: "waveform.path.ecg",
-                title: state.engine.isRunning ? "正在采集实时速率…" : "核心未运行",
-                subtitle: state.engine.isRunning
+                title: state.isCoreRunning ? "正在采集实时速率…" : "核心未运行",
+                subtitle: state.isCoreRunning
                     ? "建立代理流量后将在此绘制最近 60 秒的上传/下载速率曲线。"
                     : "启动核心后即可实时查看上传与下载速率波动，历史消耗仍可在「今日分时 / 近 7 天」查看。"
             )

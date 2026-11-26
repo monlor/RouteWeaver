@@ -53,7 +53,7 @@ struct ConnectionInspectorView: View {
                     }
                     .controlSize(.small)
 
-                    if item.isActive && state.engine.isRunning {
+                    if item.isActive && state.isCoreRunning {
                         Spacer()
                         Button(role: .destructive) {
                             state.closeMonitoredConnection(id: item.id)
@@ -142,6 +142,7 @@ struct ConnectionInspectorView: View {
                 }
             }
             .padding(16)
+            .lockScrollDocumentWidth()
         }
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
     }

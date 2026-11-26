@@ -1,6 +1,13 @@
 import RoutingCore
 import SwiftUI
 
+private enum TrafficSourcePaneTab: String, CaseIterable, Identifiable {
+    case process = "进程"
+    case client = "来源设备"
+
+    var id: String { rawValue }
+}
+
 struct TrafficStatsView: View {
     @ObservedObject var state: AppState
     @ObservedObject var monitor: ConnectionMonitorService
@@ -9,7 +16,9 @@ struct TrafficStatsView: View {
     @State private var sortField: TrafficRankingSortField = .total
     @State private var sortAscending: Bool = false
     @State private var searchText: String = ""
+    @State private var sourceTab: TrafficSourcePaneTab = .process
     @State private var selectedProcess: String? = nil
+    @State private var selectedClient: String? = nil
 
     private var processReport: TrafficRankingReport {
         monitor.trafficRanking.report(
@@ -21,11 +30,31 @@ struct TrafficStatsView: View {
         )
     }
 
+    private var visibleProcessItems: [TrafficRankingItem] {
+        processReport.items.filter { !$0.isUnknown }
+    }
+
+    private var clientReport: TrafficRankingReport {
+        monitor.trafficRanking.report(
+            dimension: .client,
+            window: window,
+            sortBy: sortField,
+            ascending: sortAscending,
+            searchText: searchText,
+            displayAliases: state.lanDeviceNamesByIP
+        )
+    }
+
+    private var visibleClientItems: [TrafficRankingItem] {
+        clientReport.items.filter { !$0.isUnknown }
+    }
+
     private var domainReport: TrafficRankingReport {
         monitor.trafficRanking.report(
             dimension: .domain,
             window: window,
             processFilter: selectedProcess,
+            clientFilter: selectedClient,
             sortBy: sortField,
             ascending: sortAscending,
             searchText: searchText
@@ -37,6 +66,7 @@ struct TrafficStatsView: View {
             dimension: .ip,
             window: window,
             processFilter: selectedProcess,
+            clientFilter: selectedClient,
             sortBy: sortField,
             ascending: sortAscending,
             searchText: searchText
@@ -44,45 +74,65 @@ struct TrafficStatsView: View {
     }
 
     private var hasAnyWindowData: Bool {
-        !processReport.items.isEmpty || !domainReport.items.isEmpty || !ipReport.items.isEmpty
+        !processReport.items.isEmpty || !clientReport.items.isEmpty || !domainReport.items.isEmpty || !ipReport.items.isEmpty
     }
 
     var body: some View {
         let procReport = processReport
+        let cliReport = clientReport
         let domReport = domainReport
         let addrReport = ipReport
 
         VStack(spacing: 0) {
-            topHeaderArea(procReport: procReport, domReport: domReport, addrReport: addrReport)
+            topHeaderArea(procReport: procReport, cliReport: cliReport, domReport: domReport, addrReport: addrReport)
                 .padding(.horizontal, 20)
                 .padding(.top, 16)
                 .padding(.bottom, 12)
 
             Divider()
 
-            if procReport.items.isEmpty && domReport.items.isEmpty && addrReport.items.isEmpty {
+            if procReport.items.isEmpty && cliReport.items.isEmpty && domReport.items.isEmpty && addrReport.items.isEmpty {
                 emptyState(coverage: procReport.coverage)
             } else {
-                HStack(alignment: .top, spacing: 14) {
-                    processPane(report: procReport)
-                        .frame(minWidth: 270, idealWidth: 320, maxWidth: 370)
+                GeometryReader { geo in
+                    let isCompact = geo.size.width < 660
+                    if isCompact {
+                        ScrollView {
+                            VStack(spacing: 12) {
+                                sourcePane(procReport: procReport, cliReport: cliReport)
+                                    .frame(height: 240)
+                                targetPane(title: "域名排行", dimension: .domain, report: domReport)
+                                    .frame(height: 250)
+                                targetPane(title: "IP 排行", dimension: .ip, report: addrReport)
+                                    .frame(height: 250)
+                            }
+                            .padding(16)
+                            .lockScrollDocumentWidth()
+                        }
+                    } else {
+                        HStack(alignment: .top, spacing: 12) {
+                            sourcePane(procReport: procReport, cliReport: cliReport)
+                                .frame(minWidth: 220, idealWidth: 265, maxWidth: 310, minHeight: 0, maxHeight: .infinity)
 
-                    VStack(spacing: 12) {
-                        targetPane(
-                            title: "域名排行",
-                            dimension: .domain,
-                            report: domReport
-                        )
-                        targetPane(
-                            title: "IP 排行",
-                            dimension: .ip,
-                            report: addrReport
-                        )
+                            VStack(spacing: 12) {
+                                targetPane(
+                                    title: "域名排行",
+                                    dimension: .domain,
+                                    report: domReport
+                                )
+                                targetPane(
+                                    title: "IP 排行",
+                                    dimension: .ip,
+                                    report: addrReport
+                                )
+                            }
+                            .frame(minWidth: 320, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+                        }
+                        .padding(16)
+                        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .padding(16)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
             }
 
             Divider()
@@ -92,9 +142,21 @@ struct TrafficStatsView: View {
                 .padding(.vertical, 8)
                 .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
         }
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .top)
         .onChange(of: window) { _ in
             if let selected = selectedProcess,
                !monitor.trafficRanking.report(dimension: .process, window: window).items.contains(where: { $0.key == selected }) {
+                selectedProcess = nil
+            }
+            if let selected = selectedClient,
+               !monitor.trafficRanking.report(dimension: .client, window: window).items.contains(where: { $0.key == selected }) {
+                selectedClient = nil
+            }
+        }
+        .onChange(of: sourceTab) { newTab in
+            if newTab == .process {
+                selectedClient = nil
+            } else {
                 selectedProcess = nil
             }
         }
@@ -104,21 +166,34 @@ struct TrafficStatsView: View {
 
     private func topHeaderArea(
         procReport: TrafficRankingReport,
+        cliReport: TrafficRankingReport,
         domReport: TrafficRankingReport,
         addrReport: TrafficRankingReport
     ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            kpiStrip(procReport: procReport, domReport: domReport, addrReport: addrReport)
+            kpiStrip(procReport: procReport, cliReport: cliReport, domReport: domReport, addrReport: addrReport)
             controlsBar
         }
     }
 
     private func kpiStrip(
         procReport: TrafficRankingReport,
+        cliReport: TrafficRankingReport,
         domReport: TrafficRankingReport,
         addrReport: TrafficRankingReport
     ) -> some View {
-        HStack(spacing: 12) {
+        let activeSourceTitle: String
+        if selectedClient != nil {
+            activeSourceTitle = "当前设备访问目标"
+        } else if selectedProcess != nil {
+            activeSourceTitle = "当前进程访问目标"
+        } else {
+            activeSourceTitle = "全局可观测目标"
+        }
+        return LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 180), spacing: 12)],
+            spacing: 12
+        ) {
             metricTile(
                 title: "\(window.title)总流量",
                 value: TrafficFormatter.bytes(procReport.grandTotal),
@@ -127,18 +202,29 @@ struct TrafficStatsView: View {
                 color: .purple
             )
 
-            metricTile(
-                title: "进程分布",
-                value: "\(procReport.items.count) 个进程",
-                subtitle: selectedProcess.map { "已筛选：\($0)" } ?? "点击左侧进程联动筛选",
-                icon: "app.dashed",
-                color: .indigo
-            )
+            if sourceTab == .client {
+                let deviceCount = cliReport.items.filter { !$0.isUnknown }.count
+                metricTile(
+                    title: "来源设备",
+                    value: "\(deviceCount) 台设备",
+                    subtitle: selectedClient.map { "已筛选：\(state.clientShortLabel(for: $0))" } ?? "点击左侧设备查看域名与 IP",
+                    icon: "laptopcomputer.and.iphone",
+                    color: .teal
+                )
+            } else {
+                metricTile(
+                    title: "进程分布",
+                    value: "\(visibleProcessItems.count) 个进程",
+                    subtitle: selectedProcess.map { "已筛选：\($0)" } ?? "点击左侧进程查看域名与 IP",
+                    icon: "app.dashed",
+                    color: .indigo
+                )
+            }
 
             metricTile(
                 title: "目标分布",
                 value: "\(domReport.items.count) 域名 · \(addrReport.items.count) IP",
-                subtitle: selectedProcess == nil ? "全局可观测目标" : "当前进程访问目标",
+                subtitle: activeSourceTitle,
                 icon: "globe",
                 color: .blue
             )
@@ -195,7 +281,7 @@ struct TrafficStatsView: View {
     }
 
     private var controlsBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Picker("", selection: $window) {
                 ForEach(TrafficRankingWindow.allCases) { item in
                     Text(item.title).tag(item)
@@ -203,13 +289,13 @@ struct TrafficStatsView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 270)
+            .frame(width: 215)
 
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
                     .font(.caption)
-                TextField("搜索进程、域名或 IP…", text: $searchText)
+                TextField("搜索进程、来源设备、域名或 IP…", text: $searchText)
                     .textFieldStyle(.plain)
                     .font(.subheadline)
                 if !searchText.isEmpty {
@@ -234,9 +320,27 @@ struct TrafficStatsView: View {
                     .strokeBorder(Color.secondary.opacity(0.22))
                     .allowsHitTesting(false)
             }
-            .frame(minWidth: 160, maxWidth: .infinity)
+            .frame(minWidth: 100, maxWidth: .infinity)
 
-            if let selectedProcess {
+            if let selectedClient {
+                Button {
+                    self.selectedClient = nil
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("设备: \(state.clientShortLabel(for: selectedClient))")
+                            .lineLimit(1)
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption2)
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.teal)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(Color.teal.opacity(0.14)))
+                }
+                .buttonStyle(.plain)
+                .help("清除设备筛选，恢复查看全部目标")
+            } else if let selectedProcess {
                 Button {
                     self.selectedProcess = nil
                 } label: {
@@ -291,57 +395,76 @@ struct TrafficStatsView: View {
 
             Button(role: .destructive) {
                 selectedProcess = nil
+                selectedClient = nil
                 monitor.clearTrafficRanking()
                 state.showFeedback("已清空流量排行统计")
             } label: {
                 Label("清空统计", systemImage: "trash")
             }
             .controlSize(.small)
+            .fixedSize()
             .disabled(monitor.trafficRanking.trackingStartedAt == nil)
             .help("清空本地保存的进程、域名与 IP 流量排行数据")
         }
     }
 
-    // MARK: - Left Pane: Process Ranking
+    // MARK: - Left Pane: Process & Source Device Ranking
 
-    private func processPane(report: TrafficRankingReport) -> some View {
-        VStack(spacing: 0) {
+    private func sourcePane(procReport: TrafficRankingReport, cliReport: TrafficRankingReport) -> some View {
+        let isClientMode = (sourceTab == .client)
+        let items = (isClientMode ? cliReport.items : procReport.items).filter { !$0.isUnknown }
+        let hasSelection = isClientMode ? (selectedClient != nil) : (selectedProcess != nil)
+
+        return VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Label("进程排行", systemImage: "app.dashed")
-                    .font(.headline)
+                Picker("", selection: $sourceTab) {
+                    ForEach(TrafficSourcePaneTab.allCases) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 132)
+
                 Spacer()
-                if selectedProcess != nil {
+                if hasSelection {
                     Button("全部") {
                         selectedProcess = nil
+                        selectedClient = nil
                     }
                     .buttonStyle(.link)
                     .font(.caption)
                 }
-                Text("\(report.items.count) 项")
+                Text("\(items.count) 项")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
             .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
 
-            if report.items.isEmpty {
-                paneEmptyState("暂无匹配进程")
+            if items.isEmpty {
+                paneEmptyState(isClientMode ? "暂无来源设备流量数据" : "暂无可识别进程")
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(Array(report.items.enumerated()), id: \.element.id) { index, item in
-                            processRow(rank: index + 1, item: item)
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                            if isClientMode {
+                                clientRow(rank: index + 1, item: item)
+                            } else {
+                                processRow(rank: index + 1, item: item)
+                            }
                             Divider()
                                 .padding(.leading, 36)
                         }
                     }
                 }
+                .frame(minHeight: 0, maxHeight: .infinity)
             }
         }
-        .frame(maxHeight: .infinity)
+        .frame(minHeight: 0, maxHeight: .infinity)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(Color(nsColor: .textBackgroundColor).opacity(0.45))
@@ -352,6 +475,105 @@ struct TrafficStatsView: View {
                 .allowsHitTesting(false)
         }
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func clientRow(rank: Int, item: TrafficRankingItem) -> some View {
+        let isSelected = selectedClient == item.key
+        let isLocal = item.key == TrafficAttribution.localDeviceLabel
+        let displayTitle = state.clientShortLabel(for: item.key)
+        let hasSeparateIP = !isLocal && displayTitle != item.key
+
+        return HStack(spacing: 8) {
+            Text("\(rank)")
+                .font(.system(.caption2, design: .monospaced).weight(rank <= 3 ? .semibold : .regular))
+                .foregroundStyle(rank <= 3 ? .primary : .tertiary)
+                .frame(width: 20, alignment: .trailing)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Image(systemName: isLocal ? "laptopcomputer" : "iphone.and.arrow.forward")
+                        .font(.caption2)
+                        .foregroundStyle(isLocal ? Color.secondary : Color.teal)
+
+                    Text(displayTitle)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(item.isOther ? .secondary : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    if isLocal {
+                        badgeTag("本机", color: .secondary)
+                    } else if item.isOther {
+                        badgeTag("低频合并", color: .secondary)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    Text(TrafficFormatter.bytes(item.total))
+                        .font(.system(.caption, design: .monospaced).weight(.semibold))
+                        .foregroundStyle(.primary)
+                }
+
+                if hasSeparateIP {
+                    Text(item.key)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 6) {
+                    Text("↑ \(TrafficFormatter.shortBytes(item.upload))")
+                        .foregroundStyle(.blue)
+                    Text("↓ \(TrafficFormatter.shortBytes(item.download))")
+                        .foregroundStyle(.green)
+
+                    Spacer(minLength: 4)
+
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.secondary.opacity(0.14))
+                            Capsule()
+                                .fill(isLocal ? Color.secondary.opacity(0.7) : Color.teal.opacity(0.85))
+                                .frame(width: max(item.total > 0 ? 3 : 0, geo.size.width * (item.percentage / 100.0)))
+                        }
+                    }
+                    .frame(width: 36, height: 5)
+
+                    Text(String(format: "%.1f%%", item.percentage))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 38, alignment: .trailing)
+
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(isSelected ? Color.teal : Color.secondary.opacity(0.45))
+                }
+                .font(.system(.caption2, design: .monospaced))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+        .background(isSelected ? Color.teal.opacity(0.14) : Color.clear)
+        .onTapGesture {
+            selectedProcess = nil
+            selectedClient = isSelected ? nil : item.key
+        }
+        .contextMenu {
+            Button(isSelected ? "取消设备筛选" : "筛选此设备的目标流量") {
+                selectedProcess = nil
+                selectedClient = isSelected ? nil : item.key
+            }
+            if !isLocal {
+                Button("复制设备 IP (\(item.key))") {
+                    state.copyText(item.key, label: "设备 IP \(item.key)")
+                }
+            }
+            Button("复制统计摘要") {
+                let name = state.clientDisplayLabel(for: item.key)
+                let summary = "\(name) | 总计 \(TrafficFormatter.bytes(item.total)) (↑ \(TrafficFormatter.bytes(item.upload)) / ↓ \(TrafficFormatter.bytes(item.download))) · 占比 \(String(format: "%.1f%%", item.percentage))"
+                state.copyText(summary, label: "设备流量统计摘要")
+            }
+        }
     }
 
     private func processRow(rank: Int, item: TrafficRankingItem) -> some View {
@@ -399,11 +621,15 @@ struct TrafficStatsView: View {
                                 .frame(width: max(item.total > 0 ? 3 : 0, geo.size.width * (item.percentage / 100.0)))
                         }
                     }
-                    .frame(width: 44, height: 5)
+                    .frame(width: 36, height: 5)
 
                     Text(String(format: "%.1f%%", item.percentage))
                         .foregroundStyle(.secondary)
-                        .frame(width: 42, alignment: .trailing)
+                        .frame(width: 38, alignment: .trailing)
+
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary.opacity(0.45))
                 }
                 .font(.system(.caption2, design: .monospaced))
             }
@@ -440,16 +666,25 @@ struct TrafficStatsView: View {
             HStack(spacing: 8) {
                 Label(title, systemImage: dimension.icon)
                     .font(.headline)
-                if let selectedProcess {
+                if let selectedClient {
+                    Text("· \(state.clientShortLabel(for: selectedClient))")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.teal)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else if let selectedProcess {
                     Text("· \(selectedProcess)")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(Color.accentColor)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 Text("\(report.items.count) 项 · 共 \(TrafficFormatter.bytes(report.grandTotal))")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
@@ -472,9 +707,10 @@ struct TrafficStatsView: View {
                         }
                     }
                 }
+                .frame(minHeight: 0, maxHeight: .infinity)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(Color(nsColor: .textBackgroundColor).opacity(0.45))
@@ -488,23 +724,23 @@ struct TrafficStatsView: View {
     }
 
     private func targetTableHeader(dimension: TrafficRankingDimension) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Text("#")
-                .frame(width: 24, alignment: .trailing)
+                .frame(width: 22, alignment: .trailing)
             sortableHeader(dimension.columnTitle, field: .name, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minWidth: 90, maxWidth: .infinity, alignment: .leading)
             sortableHeader("上传", field: .upload, alignment: .trailing)
-                .frame(width: 82, alignment: .trailing)
+                .frame(width: 66, alignment: .trailing)
             sortableHeader("下载", field: .download, alignment: .trailing)
-                .frame(width: 82, alignment: .trailing)
+                .frame(width: 66, alignment: .trailing)
             sortableHeader("总量", field: .total, alignment: .trailing)
-                .frame(width: 88, alignment: .trailing)
+                .frame(width: 68, alignment: .trailing)
             Text("占比")
-                .frame(width: 112, alignment: .trailing)
+                .frame(width: 82, alignment: .trailing)
         }
         .font(.caption.weight(.medium))
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
     }
@@ -535,19 +771,18 @@ struct TrafficStatsView: View {
     }
 
     private func targetRow(rank: Int, dimension: TrafficRankingDimension, item: TrafficRankingItem) -> some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Text("\(rank)")
                 .font(.system(.caption2, design: .monospaced).weight(rank <= 3 ? .semibold : .regular))
                 .foregroundStyle(rank <= 3 ? .primary : .tertiary)
-                .frame(width: 24, alignment: .trailing)
+                .frame(width: 22, alignment: .trailing)
 
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 Text(item.key)
                     .font(.system(.caption, design: .monospaced).weight(.medium))
                     .foregroundStyle(item.isUnknown || item.isOther ? .secondary : .primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .textSelection(.enabled)
 
                 if item.isUnknown {
                     badgeTag("未归因", color: .orange)
@@ -555,24 +790,27 @@ struct TrafficStatsView: View {
                     badgeTag("低频合并", color: .secondary)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minWidth: 90, maxWidth: .infinity, alignment: .leading)
 
             Text(TrafficFormatter.bytes(item.upload))
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.blue)
-                .frame(width: 82, alignment: .trailing)
+                .lineLimit(1)
+                .frame(width: 66, alignment: .trailing)
 
             Text(TrafficFormatter.bytes(item.download))
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.green)
-                .frame(width: 82, alignment: .trailing)
+                .lineLimit(1)
+                .frame(width: 66, alignment: .trailing)
 
             Text(TrafficFormatter.bytes(item.total))
                 .font(.system(.caption2, design: .monospaced).weight(.semibold))
                 .foregroundStyle(.primary)
-                .frame(width: 88, alignment: .trailing)
+                .lineLimit(1)
+                .frame(width: 68, alignment: .trailing)
 
-            HStack(spacing: 6) {
+            HStack(spacing: 4) {
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         Capsule().fill(Color.secondary.opacity(0.14))
@@ -581,16 +819,17 @@ struct TrafficStatsView: View {
                             .frame(width: max(item.total > 0 ? 3 : 0, geo.size.width * (item.percentage / 100.0)))
                     }
                 }
-                .frame(width: 56, height: 5)
+                .frame(width: 36, height: 5)
 
                 Text(String(format: "%.1f%%", item.percentage))
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .frame(width: 44, alignment: .trailing)
+                    .lineLimit(1)
+                    .frame(width: 40, alignment: .trailing)
             }
-            .frame(width: 112, alignment: .trailing)
+            .frame(width: 82, alignment: .trailing)
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 10)
         .padding(.vertical, 7)
         .contentShape(Rectangle())
         .contextMenu {
@@ -650,7 +889,7 @@ struct TrafficStatsView: View {
                     searchText = ""
                 }
                 .controlSize(.small)
-            } else if !state.engine.isRunning && !hasRecordedBuckets {
+            } else if !state.isCoreRunning && !hasRecordedBuckets {
                 Button {
                     state.start()
                 } label: {
@@ -666,14 +905,15 @@ struct TrafficStatsView: View {
     }
 
     private var scopeFooter: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: "info.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .padding(.top, 1)
             Text("统计口径：进程、域名、IP 为同一份可观测核心流量的三种维度（各面板独立合计 100%，不跨面板相加，不含内部中继 Inner）；缺失归因与采样间隔内短连接归入「未知」，不进行反向 DNS 猜测或外部查询；本地按分钟（60 分钟）与按日（7 天）有界聚合。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
     }

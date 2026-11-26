@@ -50,6 +50,7 @@ struct RequestMonitorView: View {
     @State private var dnsSourceFilter: DNSLogSourceFilter = .all
     @State private var hideEmptyDNSAnswers = false
     @State private var selectedTarget: String? = nil
+    @State private var selectedClient: String? = nil
     @State private var sortOrder: ConnectionSortOrder = .newest
     @State private var selectedConnectionID: String? = nil
     @State private var selectedDNSLogID: UUID? = nil
@@ -65,6 +66,9 @@ struct RequestMonitorView: View {
             scope: scope,
             searchText: searchText,
             targetFilter: selectedTarget,
+            clientFilter: selectedClient,
+            localIPs: Set(state.lanIPAddresses),
+            clientDisplayNames: state.lanDeviceNamesByIP,
             sortOrder: sortOrder,
             ruleIndex: ruleIndex,
             includeInner: showInnerConnections
@@ -94,13 +98,17 @@ struct RequestMonitorView: View {
         monitor.tracker.availableTargets(includeInner: showInnerConnections)
     }
 
+    private var availableClients: [String] {
+        monitor.tracker.availableClients(localIPs: Set(state.lanIPAddresses), includeInner: showInnerConnections)
+    }
+
     private func resolvedRelayChain(for item: MonitoredConnection) -> ResolvedRelayChain? {
-        let currentNodes = state.liveProxyStore.groupStatus.mapValues(\.now)
+        let currentNodes = state.activeLiveProxyStore.groupStatus.mapValues(\.now)
         return RelayChainResolver.resolve(
             for: item,
             profile: state.profile,
             runtimeCurrentNodes: currentNodes,
-            runtimeSelections: state.liveProxyStore.groupSelection
+            runtimeSelections: state.activeLiveProxyStore.groupSelection
         )
     }
 
@@ -113,15 +121,21 @@ struct RequestMonitorView: View {
 
             Divider()
 
-            if !state.engine.isRunning && monitor.tracker.recordsByID.isEmpty && monitor.dnsLogs.isEmpty {
+            if !state.isCoreRunning && monitor.tracker.recordsByID.isEmpty && monitor.dnsLogs.isEmpty {
                 idleEmptyState
             } else if activeTab == .dns {
-                HStack(spacing: 0) {
+                AdaptiveInspectorScaffold(
+                    isInspectorPresented: selectedDNSLog != nil,
+                    inspectorWidth: 336,
+                    minContentWidth: 520,
+                    onDismiss: { selectedDNSLogID = nil }
+                ) { availableWidth in
                     DNSLogListView(
                         state: state,
                         monitor: monitor,
                         rows: filteredDNSLogs,
                         selectedDNSLogID: $selectedDNSLogID,
+                        availableWidth: availableWidth,
                         onResetFilters: {
                             searchText = ""
                             dnsScope = .all
@@ -129,33 +143,39 @@ struct RequestMonitorView: View {
                             hideEmptyDNSAnswers = false
                         }
                     )
+                } inspector: {
                     if let selected = selectedDNSLog {
-                        Divider()
                         DNSLogInspectorView(
                             state: state,
                             item: selected,
                             onClose: { selectedDNSLogID = nil }
                         )
-                        .frame(width: 336)
                     }
                 }
             } else {
-                HStack(spacing: 0) {
+                AdaptiveInspectorScaffold(
+                    isInspectorPresented: selectedConnection != nil,
+                    inspectorWidth: 336,
+                    minContentWidth: 520,
+                    onDismiss: { selectedConnectionID = nil }
+                ) { availableWidth in
                     ConnectionListView(
                         state: state,
                         monitor: monitor,
                         rows: filteredConnections,
                         ruleIndex: ruleIndex,
                         selectedConnectionID: $selectedConnectionID,
+                        availableWidth: availableWidth,
                         resolveRelayChain: resolvedRelayChain(for:),
                         onResetFilters: {
                             searchText = ""
                             scope = .all
                             selectedTarget = nil
+                            selectedClient = nil
                         }
                     )
+                } inspector: {
                     if let selected = selectedConnection {
-                        Divider()
                         ConnectionInspectorView(
                             state: state,
                             item: selected,
@@ -163,7 +183,6 @@ struct RequestMonitorView: View {
                             relayChain: resolvedRelayChain(for: selected),
                             onClose: { selectedConnectionID = nil }
                         )
-                        .frame(width: 336)
                     }
                 }
             }
@@ -175,15 +194,18 @@ struct RequestMonitorView: View {
     private var topHeaderArea: some View {
         VStack(alignment: .leading, spacing: 12) {
             metricsStrip
-            if showSpeedChart && activeTab == .connections && (state.engine.isRunning || !monitor.tracker.speedHistory.isEmpty) {
-                LiveSpeedSparklineCard(monitor: monitor, isRunning: state.engine.isRunning)
+            if showSpeedChart && activeTab == .connections && (state.isCoreRunning || !monitor.tracker.speedHistory.isEmpty) {
+                LiveSpeedSparklineCard(monitor: monitor, isRunning: state.isCoreRunning)
             }
             filterControlBar
         }
     }
 
     private var metricsStrip: some View {
-        HStack(spacing: 12) {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 180), spacing: 12)],
+            spacing: 12
+        ) {
             metricTile(
                 title: "实时上传",
                 value: TrafficFormatter.speed(monitor.tracker.uploadSpeed),
@@ -226,7 +248,7 @@ struct RequestMonitorView: View {
     }
 
     private var streamStatusSubtitle: String {
-        if !state.engine.isRunning { return "核心未运行" }
+        if !state.isCoreRunning { return "核心未运行" }
         if monitor.isPaused { return "界面已暂停刷新" }
         if monitor.isStreaming { return "实时监控中" }
         return monitor.lastError ?? "正在连接接口…"
@@ -290,7 +312,7 @@ struct RequestMonitorView: View {
                         .foregroundStyle(.secondary)
                         .font(.caption)
                     TextField(
-                        activeTab == .dns ? "搜索域名、IP、上游 DNS 或错误…" : "搜索域名、IP、进程、规则或节点…",
+                        activeTab == .dns ? "搜索域名、IP、上游 DNS 或错误…" : "搜索域名、IP、来源设备、进程、规则或节点…",
                         text: $searchText
                     )
                     .textFieldStyle(.plain)
@@ -337,7 +359,7 @@ struct RequestMonitorView: View {
                     Label(monitor.isPaused ? "继续" : "暂停", systemImage: monitor.isPaused ? "play.fill" : "pause.fill")
                 }
                 .controlSize(.small)
-                .disabled(!state.engine.isRunning)
+                .disabled(!state.isCoreRunning)
                 .help(monitor.isPaused ? "恢复实时刷新" : "暂停界面刷新以便查看细节")
 
                 if activeTab == .dns {
@@ -348,14 +370,14 @@ struct RequestMonitorView: View {
                         } label: {
                             Label("清空日志与 DNS 缓存", systemImage: "trash")
                         }
-                        .disabled(!state.engine.isRunning)
+                        .disabled(!state.isCoreRunning)
 
                         Button {
                             state.flushDNSCache(includeFakeIP: false)
                         } label: {
                             Label("仅清空内核 DNS 缓存", systemImage: "arrow.triangle.2.circlepath")
                         }
-                        .disabled(!state.engine.isRunning)
+                        .disabled(!state.isCoreRunning)
 
                         if state.profile.effectiveTunEnabled && state.profile.tunDNSMode == .fakeIP {
                             Button {
@@ -364,7 +386,7 @@ struct RequestMonitorView: View {
                             } label: {
                                 Label("清空日志、DNS 与 Fake-IP 缓存", systemImage: "flame")
                             }
-                            .disabled(!state.engine.isRunning)
+                            .disabled(!state.isCoreRunning)
                         }
 
                         Divider()
@@ -380,14 +402,14 @@ struct RequestMonitorView: View {
                         Label("清空 DNS", systemImage: "trash")
                     } primaryAction: {
                         selectedDNSLogID = nil
-                        if state.engine.isRunning {
+                        if state.isCoreRunning {
                             state.clearDNSLogsAndCache(includeFakeIP: false)
                         } else {
                             monitor.clearDNSLogs()
                         }
                     }
                     .controlSize(.small)
-                    .disabled((!state.engine.isRunning && monitor.dnsLogs.isEmpty) || monitor.isFlushingDNSCache)
+                    .disabled((!state.isCoreRunning && monitor.dnsLogs.isEmpty) || monitor.isFlushingDNSCache)
                     .help("点击清空 DNS 日志并刷新内核 DNS 缓存；下拉可选择仅清空日志、仅清缓存或同时清空 Fake-IP 缓存")
                 } else {
                     Button {
@@ -396,7 +418,7 @@ struct RequestMonitorView: View {
                         Label("断开全部", systemImage: "xmark.circle")
                     }
                     .controlSize(.small)
-                    .disabled(!state.engine.isRunning || monitor.tracker.activeCount == 0 || monitor.isClosingConnections)
+                    .disabled(!state.isCoreRunning || monitor.tracker.activeCount == 0 || monitor.isClosingConnections)
                     .help("强制断开当前所有活跃连接")
 
                     Button {
@@ -413,47 +435,48 @@ struct RequestMonitorView: View {
                 }
             }
 
-            HStack(spacing: 10) {
-                if activeTab == .dns {
-                    Picker("", selection: $dnsScope) {
-                        ForEach(DNSLogFilterScope.allCases) { item in
-                            Text(item.title).tag(item)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 160)
-
-                    Menu {
-                        ForEach(DNSLogSourceFilter.allCases) { source in
-                            Button {
-                                dnsSourceFilter = source
-                            } label: {
-                                if dnsSourceFilter == source {
-                                    Label(source.title, systemImage: "checkmark")
-                                } else {
-                                    Text(source.title)
-                                }
+            if activeTab == .dns {
+                SplitHeaderBar(horizontalSpacing: 10, verticalSpacing: 6) {
+                    FlowLayout(horizontalSpacing: 10, verticalSpacing: 6) {
+                        Picker("", selection: $dnsScope) {
+                            ForEach(DNSLogFilterScope.allCases) { item in
+                                Text(item.title).tag(item)
                             }
                         }
-                    } label: {
-                        Label(dnsSourceFilter.title, systemImage: "line.3.horizontal.decrease.circle")
-                            .font(.caption)
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 160)
+
+                        Menu {
+                            ForEach(DNSLogSourceFilter.allCases) { source in
+                                Button {
+                                    dnsSourceFilter = source
+                                } label: {
+                                    if dnsSourceFilter == source {
+                                        Label(source.title, systemImage: "checkmark")
+                                    } else {
+                                        Text(source.title)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label(dnsSourceFilter.title, systemImage: "line.3.horizontal.decrease.circle")
+                                .font(.caption)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+
+                        Toggle(isOn: $hideEmptyDNSAnswers) {
+                            Text("隐藏无记录")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .fixedSize()
+                        .help("隐藏未返回 IP 的空响应（如常见无 IPv6 记录的 AAAA 查询）")
                     }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-
-                    Toggle(isOn: $hideEmptyDNSAnswers) {
-                        Text("隐藏无记录")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .toggleStyle(.checkbox)
-                    .controlSize(.small)
-                    .help("隐藏未返回 IP 的空响应（如常见无 IPv6 记录的 AAAA 查询）")
-
-                    Spacer()
-
+                } trailing: {
                     let cacheCount = monitor.cacheHitDNSCount
                     let failedCount = monitor.failedDNSCount
                     Text(
@@ -463,75 +486,108 @@ struct RequestMonitorView: View {
                     )
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                } else {
-                    Picker("", selection: $scope) {
-                        ForEach(ConnectionFilterScope.allCases) { item in
-                            Text(item.title).tag(item)
+                    .lineLimit(1)
+                }
+            } else {
+                SplitHeaderBar(horizontalSpacing: 10, verticalSpacing: 6) {
+                    FlowLayout(horizontalSpacing: 10, verticalSpacing: 6) {
+                        Picker("", selection: $scope) {
+                            ForEach(ConnectionFilterScope.allCases) { item in
+                                Text(item.title).tag(item)
+                            }
                         }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 160)
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 160)
 
-                    Menu {
-                        Button("全部出口") { selectedTarget = nil }
-                        if !availableTargets.isEmpty {
-                            Divider()
-                            ForEach(availableTargets, id: \.self) { target in
-                                Button {
-                                    selectedTarget = target
-                                } label: {
-                                    if selectedTarget == target {
-                                        Label(target, systemImage: "checkmark")
-                                    } else {
-                                        Text(target)
+                        Menu {
+                            Button("全部设备") { selectedClient = nil }
+                            if !availableClients.isEmpty {
+                                Divider()
+                                ForEach(availableClients, id: \.self) { client in
+                                    Button {
+                                        selectedClient = client
+                                    } label: {
+                                        let title = state.clientDisplayLabel(for: client)
+                                        if selectedClient == client {
+                                            Label(title, systemImage: "checkmark")
+                                        } else {
+                                            Text(title)
+                                        }
                                     }
                                 }
                             }
-                        }
-                    } label: {
-                        Label(selectedTarget ?? "全部出口", systemImage: "line.3.horizontal.decrease.circle")
+                        } label: {
+                            Label(
+                                selectedClient.map { state.clientShortLabel(for: $0) } ?? "全部设备",
+                                systemImage: "laptopcomputer.and.iphone"
+                            )
                             .font(.caption)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("按来源设备（本机或局域网设备）筛选连接请求")
 
-                    Menu {
-                        ForEach(ConnectionSortOrder.allCases) { order in
-                            Button {
-                                sortOrder = order
-                            } label: {
-                                if sortOrder == order {
-                                    Label(order.title, systemImage: "checkmark")
-                                } else {
-                                    Text(order.title)
+                        Menu {
+                            Button("全部出口") { selectedTarget = nil }
+                            if !availableTargets.isEmpty {
+                                Divider()
+                                ForEach(availableTargets, id: \.self) { target in
+                                    Button {
+                                        selectedTarget = target
+                                    } label: {
+                                        if selectedTarget == target {
+                                            Label(target, systemImage: "checkmark")
+                                        } else {
+                                            Text(target)
+                                        }
+                                    }
                                 }
                             }
+                        } label: {
+                            Label(selectedTarget ?? "全部出口", systemImage: "line.3.horizontal.decrease.circle")
+                                .font(.caption)
                         }
-                    } label: {
-                        Label(sortOrder.title, systemImage: "arrow.up.arrow.down")
-                            .font(.caption)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
 
+                        Menu {
+                            ForEach(ConnectionSortOrder.allCases) { order in
+                                Button {
+                                    sortOrder = order
+                                } label: {
+                                    if sortOrder == order {
+                                        Label(order.title, systemImage: "checkmark")
+                                    } else {
+                                        Text(order.title)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label(sortOrder.title, systemImage: "arrow.up.arrow.down")
+                                .font(.caption)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+
+                        let innerCount = monitor.tracker.innerCount
+                        Toggle(isOn: $showInnerConnections) {
+                            Text(innerCount > 0 ? "内部连接 (\(innerCount))" : "内部连接")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .fixedSize()
+                        .help("显示 Mihomo 链式代理等内部隧道连接（Inner），默认隐藏以减少列表重复干扰")
+                        .onChange(of: showInnerConnections) { newValue in
+                            if !newValue, let selectedTarget, !availableTargets.contains(selectedTarget) {
+                                self.selectedTarget = nil
+                            }
+                        }
+                    }
+                } trailing: {
                     let innerCount = monitor.tracker.innerCount
-                    Toggle(isOn: $showInnerConnections) {
-                        Text(innerCount > 0 ? "内部连接 (\(innerCount))" : "内部连接")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .toggleStyle(.checkbox)
-                    .controlSize(.small)
-                    .help("显示 Mihomo 链式代理等内部隧道连接（Inner），默认隐藏以减少列表重复干扰")
-                    .onChange(of: showInnerConnections) { newValue in
-                        if !newValue, let selectedTarget, !availableTargets.contains(selectedTarget) {
-                            self.selectedTarget = nil
-                        }
-                    }
-
-                    Spacer()
-
                     let visibleBaseTotal = showInnerConnections
                         ? monitor.tracker.recordsByID.count
                         : (monitor.tracker.recordsByID.count - innerCount)
@@ -542,6 +598,7 @@ struct RequestMonitorView: View {
                     )
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
                 }
             }
         }

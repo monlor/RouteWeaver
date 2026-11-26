@@ -12,16 +12,16 @@ struct NetworkTargetsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 headerBar
 
-                if state.hasPendingHotReload {
+                if state.activeHasPendingHotReload {
                     HStack(spacing: 10) {
                         InlineNote("网络目标已修改，点击「热重载生效」即可在不重启核心的情况下应用。")
                         Spacer()
                         Button("热重载生效") { state.hotReload() }
                             .controlSize(.small)
                             .buttonStyle(.borderedProminent)
-                            .disabled(state.isHotReloading || state.configValidationError != nil)
+                            .disabled(state.isHotReloading || state.activeConfigValidationError != nil)
                     }
-                } else if state.engine.isRunning {
+                } else if state.isCoreRunning {
                     InlineNote("核心运行中，支持直接编辑网络目标，修改后点击顶部「热重载生效」即可应用。")
                 }
 
@@ -243,7 +243,7 @@ struct NetworkTargetsView: View {
                             .fontWeight(.medium)
                     }
 
-                    if state.engine.isRunning && liveSpeed.total > 0 {
+                    if state.isCoreRunning && liveSpeed.total > 0 {
                         Text("·")
                             .foregroundStyle(.quaternary)
                         HStack(spacing: 4) {
@@ -381,11 +381,11 @@ private struct NetworkTargetEditorSheet: View {
                             set: { draft.interfaceName = $0.isEmpty ? nil : $0 }
                         )) {
                             Text("系统默认（不绑定网卡）").tag("")
-                            ForEach(state.interfaces) { info in
+                            ForEach(state.activeInterfaces) { info in
                                 Text(info.pickerLabel).tag(info.bsdName)
                             }
                             if let current = draft.normalizedInterface,
-                               !state.interfaces.contains(where: { $0.bsdName == current }) {
+                               !state.activeInterfaces.contains(where: { $0.bsdName == current }) {
                                 Text("\(current)（当前未检测到）").tag(current)
                             }
                         }

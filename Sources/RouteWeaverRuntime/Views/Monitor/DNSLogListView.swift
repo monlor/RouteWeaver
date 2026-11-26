@@ -33,14 +33,17 @@ struct DNSLogListView: View {
     @ObservedObject var monitor: ConnectionMonitorService
     let rows: [DNSLogRecord]
     @Binding var selectedDNSLogID: UUID?
+    var availableWidth: CGFloat = 720
     let onResetFilters: () -> Void
 
     private var dnsDomainColumnWidth: CGFloat {
-        selectedDNSLogID == nil ? 256 : 196
+        if availableWidth < 600 { return 160 }
+        return selectedDNSLogID == nil ? 240 : 196
     }
 
     private var dnsUpstreamColumnWidth: CGFloat {
-        selectedDNSLogID == nil ? 188 : 148
+        if availableWidth < 600 { return 124 }
+        return selectedDNSLogID == nil ? 180 : 148
     }
 
     var body: some View {

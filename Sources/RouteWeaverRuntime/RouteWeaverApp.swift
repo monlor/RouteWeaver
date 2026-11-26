@@ -82,6 +82,14 @@ final class RouteWeaverAppDelegate: NSObject, NSApplicationDelegate {
         sigtermSource = source
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            Self.sharedState?.syncSelectedDeviceOnWindowOpen()
+            Self.onReopenMainWindow?()
+        }
+        return true
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let state = Self.sharedState else {
             return .terminateNow
@@ -156,14 +164,15 @@ public struct RouteWeaverApp: App {
     public var body: some Scene {
         Window("RouteWeaver", id: "main") {
             MainView(state: state)
-                .frame(minWidth: 860, minHeight: 600)
+                .frame(minWidth: 900, minHeight: 600)
                 .onAppear {
                     RouteWeaverAppDelegate.onReopenMainWindow = {
+                        state.syncSelectedDeviceOnWindowOpen()
                         openWindow(id: "main")
                     }
                 }
         }
-        .defaultSize(width: 980, height: 680)
+        .defaultSize(width: 1080, height: 720)
         .commands {
             SidebarCommands()
 
@@ -177,11 +186,11 @@ public struct RouteWeaverApp: App {
 
                 Button("导出 Mihomo 配置…") { state.exportConfig() }
                     .keyboardShortcut("e", modifiers: .command)
-                    .disabled(state.engine.isBusy)
+                    .disabled(state.isCoreBusy)
             }
 
             CommandMenu("控制") {
-                if state.engine.isRunning || state.engine.isBusy {
+                if state.isCoreRunning || state.isCoreBusy {
                     Button("停止核心") { state.stop() }
                         .keyboardShortcut(".", modifiers: .command)
                 } else {
@@ -192,19 +201,19 @@ public struct RouteWeaverApp: App {
 
                 Button("校验配置") { state.validate() }
                     .keyboardShortcut("v", modifiers: [.command, .shift])
-                    .disabled(state.editingLocked || state.binary == nil)
+                    .disabled(state.editingLocked || (!state.isViewingRemote && state.binary == nil))
 
                 Divider()
 
                 Button("刷新节点") { state.refreshGroups() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(!state.engine.isRunning || state.liveProxyStore.readsGroups)
+                    .disabled(!state.isCoreRunning || state.activeLiveProxyStore.readsGroups)
 
                 Button("立即更新在线规则") { state.updateOnlineRuleProviders() }
-                    .disabled(!state.engine.isRunning || state.liveProxyStore.updatingRuleProviders)
+                    .disabled(!state.isCoreRunning || state.activeLiveProxyStore.updatingRuleProviders)
 
                 Button("断开全部活跃连接") { state.closeAllMonitoredConnections() }
-                    .disabled(!state.engine.isRunning)
+                    .disabled(!state.isCoreRunning)
 
                 Button("刷新网卡列表") {
                     state.refreshInterfaces()
@@ -215,7 +224,7 @@ public struct RouteWeaverApp: App {
                 Divider()
 
                 Toggle("断网保护（Kill Switch）", isOn: Binding(
-                    get: { state.killSwitchActive },
+                    get: { state.activeKillSwitchActive },
                     set: { state.setKillSwitchEnabled($0) }
                 ))
                 .disabled(state.isUpdatingKillSwitch || state.isAuthorizingTun)
@@ -241,31 +250,37 @@ public struct RouteWeaverApp: App {
     @ViewBuilder
     private var menuBarContent: some View {
         Text("状态：\(state.engine.phase.title)")
-        Text("模式：\(state.profile.gatewayModeEnabled ? "局域网网关（TUN + DNS :53）" : (state.profile.tunEnabled ? "TUN 透明代理" : "混合代理端口"))")
+        if let link = state.remoteBridge.activeLink {
+            Text("远程接入：\(link.remoteHostName)（\(link.mode.title)）")
+            Button("断开远程接入并恢复本机网络") {
+                state.disconnectRemoteBridge()
+            }
+        }
+        Text("模式：\(state.localProfile.gatewayModeEnabled ? "局域网网关（TUN + DNS :53）" : (state.localProfile.tunEnabled ? "TUN 透明代理" : "混合代理端口"))")
         if state.killSwitchActive {
             Text("断网保护：已开启（防默认网卡泄漏）")
         }
-        Text("本机：\(state.localProxyAddress)")
-        if state.profile.gatewayModeEnabled, let lan = state.primaryLANAddress {
+        Text("本机：127.0.0.1:\(state.localProfile.mixedPort)")
+        if state.localProfile.gatewayModeEnabled, let lan = state.localPrimaryLANAddress {
             Text("网关 / DNS：\(lan)")
-        } else if state.profile.allowLAN, let lan = state.primaryLANAddress {
-            Text("局域网：\(lan):\(state.profile.mixedPort)")
+        } else if state.localProfile.allowLAN, let lan = state.localPrimaryLANAddress {
+            Text("局域网：\(lan):\(state.localProfile.mixedPort)")
         }
 
         Divider()
 
         if state.engine.isRunning || state.engine.isBusy {
-            Button("停止核心") { state.stop() }
+            Button("停止本机核心") { state.stopLocal() }
         } else {
-            Button("启动核心") { state.start() }
-                .disabled(!state.canStart)
+            Button("启动本机核心") { state.startLocal() }
+                .disabled(!state.localCanStart)
             Toggle("启用 TUN 模式", isOn: Binding(
-                get: { state.profile.tunEnabled },
-                set: { state.setTunEnabled($0) }
+                get: { state.localProfile.tunEnabled },
+                set: { state.setLocalTunEnabled($0) }
             ))
             Toggle("启用局域网网关模式", isOn: Binding(
-                get: { state.profile.gatewayModeEnabled },
-                set: { state.setGatewayModeEnabled($0) }
+                get: { state.localProfile.gatewayModeEnabled },
+                set: { state.setLocalGatewayModeEnabled($0) }
             ))
         }
 
@@ -291,6 +306,7 @@ public struct RouteWeaverApp: App {
         Divider()
 
         Button("打开 RouteWeaver 主窗口") {
+            state.syncSelectedDeviceOnWindowOpen()
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "main")
         }

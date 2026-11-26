@@ -26,16 +26,16 @@ struct SubscriptionsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if state.hasPendingHotReload {
+                if state.activeHasPendingHotReload {
                     HStack(spacing: 10) {
                         InlineNote("订阅或节点组已修改，点击「热重载生效」即可在不重启核心的情况下应用。")
                         Spacer()
                         Button("热重载生效") { state.hotReload() }
                             .controlSize(.small)
                             .buttonStyle(.borderedProminent)
-                            .disabled(state.isHotReloading || state.configValidationError != nil)
+                            .disabled(state.isHotReloading || state.activeConfigValidationError != nil)
                     }
-                } else if state.engine.isRunning {
+                } else if state.isCoreRunning {
                     InlineNote("核心运行中，支持直接编辑订阅、Host 模块与节点组，修改后点击顶部「热重载生效」即可应用。")
                 }
 
@@ -150,7 +150,10 @@ struct SubscriptionsView: View {
                                         StatusPill(sub.role.title, color: roleColor(sub.role))
 
                                         if let cacheEntry {
-                                            StatusPill("\(cacheEntry.nodes.count) 个节点", color: .green)
+                                            StatusPill(
+                                                "\(cacheEntry.effectiveNodeCount) 个节点",
+                                                color: cacheEntry.hasNodeDetails ? .green : .teal
+                                            )
                                         } else if !isFetching {
                                             StatusPill("未拉取节点", color: .secondary)
                                         }

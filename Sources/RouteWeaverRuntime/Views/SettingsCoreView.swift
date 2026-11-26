@@ -1,5 +1,6 @@
 import RoutingCore
 import SwiftUI
+import TunHelperProtocol
 
 struct SettingsCoreView: View {
     @ObservedObject var state: AppState
@@ -7,14 +8,14 @@ struct SettingsCoreView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if state.hasPendingHotReload {
+                if state.activeHasPendingHotReload {
                     HStack(spacing: 10) {
                         InlineNote("部分配置已修改，点击「热重载生效」即可在不重启核心的情况下应用。")
                         Spacer()
                         Button("热重载生效") { state.hotReload() }
                             .controlSize(.small)
                             .buttonStyle(.borderedProminent)
-                            .disabled(state.isHotReloading || state.configValidationError != nil)
+                            .disabled(state.isHotReloading || state.activeConfigValidationError != nil)
                     }
                     .padding(12)
                     .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.10)))
@@ -24,9 +25,11 @@ struct SettingsCoreView: View {
                 killSwitchCard
                 gatewayModeCard
                 proxyListenerCard
-                profileStorageCard
+                if !state.isViewingRemote {
+                    profileStorageCard
+                }
                 coreBinaryCard
-                EngineLogCardView(state: state, logStore: state.engine.logStore)
+                EngineLogCardView(state: state, logStore: state.activeLogStore)
             }
             .padding(20)
         }
@@ -39,9 +42,9 @@ struct SettingsCoreView: View {
     private var startupCard: some View {
         SectionCard("启动与自动化", icon: "power.circle") {
             HStack(spacing: 8) {
-                if state.engine.isLaunchdManaged {
+                if state.isLaunchdManaged {
                     StatusPill(
-                        state.engine.launchdRestartCount > 0
+                        !state.isViewingRemote && state.engine.launchdRestartCount > 0
                             ? "launchd 守护中（已自愈 \(state.engine.launchdRestartCount) 次）"
                             : "launchd 守护中",
                         systemImage: "shield.checkered",
@@ -49,11 +52,13 @@ struct SettingsCoreView: View {
                     )
                 }
                 StatusPill(
-                    state.launchAtLoginStatus.title,
-                    systemImage: state.launchAtLoginStatus.isEnabled ? "checkmark.circle.fill" : "circle",
-                    color: state.launchAtLoginStatus == .requiresApproval
+                    state.isViewingRemote
+                        ? (state.activeLaunchAtLoginEnabled ? "已开启" : "未开启")
+                        : state.launchAtLoginStatus.title,
+                    systemImage: state.activeLaunchAtLoginEnabled ? "checkmark.circle.fill" : "circle",
+                    color: (!state.isViewingRemote && state.launchAtLoginStatus == .requiresApproval)
                         ? .orange
-                        : (state.launchAtLoginStatus.isEnabled ? .green : .secondary)
+                        : (state.activeLaunchAtLoginEnabled ? .green : .secondary)
                 )
             }
         } content: {
@@ -63,12 +68,12 @@ struct SettingsCoreView: View {
                         Toggle(
                             "登录 macOS 时自动运行 RouteWeaver",
                             isOn: Binding(
-                                get: { state.launchAtLoginStatus.isEnabled },
+                                get: { state.activeLaunchAtLoginEnabled },
                                 set: { state.setLaunchAtLogin($0) }
                             )
                         )
                         Spacer()
-                        if state.launchAtLoginStatus == .requiresApproval {
+                        if !state.isViewingRemote && state.launchAtLoginStatus == .requiresApproval {
                             Button("打开登录项设置") {
                                 state.openLoginItemsSettings()
                             }
@@ -78,19 +83,27 @@ struct SettingsCoreView: View {
                 }
 
                 FormRow("自动启动核心", labelWidth: 168) {
-                    Toggle("打开应用时自动启动 Mihomo 核心（开机后会自动等待网卡就绪）", isOn: $state.autoStartCoreOnLaunch)
+                    Toggle("打开应用时自动启动 Mihomo 核心（开机后会自动等待网卡就绪）", isOn: Binding(
+                        get: { state.activeAutoStartCoreOnLaunch },
+                        set: { state.setAutoStartCoreOnLaunch($0) }
+                    ))
                 }
 
                 FormRow("系统级进程保活", labelWidth: 168) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Toggle("通过 macOS launchd 守护 Mihomo 核心（崩溃或被意外终止时自动拉起）", isOn: $state.systemKeepAliveEnabled)
+                        Toggle("通过 macOS launchd 守护 Mihomo 核心（崩溃或被意外终止时自动拉起）", isOn: Binding(
+                            get: { state.activeSystemKeepAliveEnabled },
+                            set: { state.setSystemKeepAliveEnabled($0) }
+                        ))
                             .disabled(state.editingLocked)
                         InlineNote("普通模式注册用户级 LaunchAgent，TUN / 网关模式注册系统级 LaunchDaemon；即使退出 RouteWeaver 界面仍持续保活，手动停止核心时会自动卸载服务。")
                     }
                 }
 
-                FormRow("说明", labelWidth: 168) {
-                    InlineNote(state.launchAtLoginStatus.detail + " 若已开启并授权 TUN 模式，开机自启核心无需重复输入管理员密码。")
+                if !state.isViewingRemote {
+                    FormRow("说明", labelWidth: 168) {
+                        InlineNote(state.launchAtLoginStatus.detail + " 若已开启并授权 TUN 模式，开机自启核心无需重复输入管理员密码。")
+                    }
                 }
             }
         }
@@ -99,9 +112,9 @@ struct SettingsCoreView: View {
     private var tunModeCard: some View {
         SectionCard("TUN 透明代理模式", icon: "shield.lefthalf.filled") {
             StatusPill(
-                state.tunPermissionStatus.title,
-                systemImage: state.tunPermissionStatus.isReady ? "checkmark.shield.fill" : "exclamationmark.shield",
-                color: tunStatusColor
+                state.activeTunPermissionTitle,
+                systemImage: state.activeTunPermissionReady ? "checkmark.shield.fill" : "exclamationmark.shield",
+                color: state.isViewingRemote ? (state.activeTunPermissionReady ? .green : .orange) : tunStatusColor
             )
         } content: {
             VStack(alignment: .leading, spacing: 12) {
@@ -117,28 +130,44 @@ struct SettingsCoreView: View {
                 }
 
                 FormRow("管理员授权状态", labelWidth: 168) {
-                    HStack(spacing: 8) {
-                        InlineNote(state.tunPermissionStatus.detail)
-                        Spacer()
-                        if state.isAuthorizingTun {
-                            ProgressView().controlSize(.small)
-                        }
-                        if state.tunPermissionStatus == .ready {
-                            Button("重新同步") { state.authorizeTun() }
+                    if state.isViewingRemote {
+                        InlineNote(state.activeTunPermissionReady
+                                   ? "远程设备 TUN 权限就绪（\(state.activeTunPermissionTitle)）。"
+                                   : "远程设备尚未授权 TUN 权限，可在远程设备本机授权或执行 ./Scripts/install-app.sh --sync-tun。")
+                    } else {
+                        HStack(spacing: 8) {
+                            InlineNote(state.tunPermissionStatus.detail)
+                            Spacer()
+                            if state.isAuthorizingTun {
+                                ProgressView().controlSize(.small)
+                            }
+                            if state.tunPermissionStatus == .ready {
+                                Button("重新同步") { state.authorizeTun() }
+                                    .controlSize(.small)
+                                    .disabled(state.engine.isBusy || state.isAuthorizingTun || state.binary == nil)
+                                    .help(state.engine.isRunning ? "将先停止核心，同步授权后自动重启" : "重新同步受信任的内核副本")
+                                Button("撤销授权") { state.revokeTunAuthorization() }
+                                    .controlSize(.small)
+                                    .disabled(state.editingLocked || state.isAuthorizingTun)
+                            } else if state.tunPermissionStatus == .needsSync {
+                                Button("同步新版组件") {
+                                    state.authorizeTun()
+                                }
                                 .controlSize(.small)
                                 .disabled(state.engine.isBusy || state.isAuthorizingTun || state.binary == nil)
-                                .help(state.engine.isRunning ? "将先停止核心，同步授权后自动重启" : "重新同步受信任的内核副本")
-                            Button("撤销授权") { state.revokeTunAuthorization() }
+                                .help("当前已授权旧组件仍可正常启停网关不断网；点击可同步新版辅助组件以启用免密内核热更新")
+                                Button("撤销授权") { state.revokeTunAuthorization() }
+                                    .controlSize(.small)
+                                    .disabled(state.editingLocked || state.isAuthorizingTun)
+                            } else if state.tunPermissionStatus != .helperMissing {
+                                Button("授权 TUN 权限") {
+                                    state.authorizeTun()
+                                }
                                 .controlSize(.small)
-                                .disabled(state.editingLocked || state.isAuthorizingTun)
-                        } else if state.tunPermissionStatus != .helperMissing {
-                            Button(state.tunPermissionStatus == .needsSync ? "重新授权" : "授权 TUN 权限") {
-                                state.authorizeTun()
+                                .buttonStyle(.borderedProminent)
+                                .disabled(state.engine.isBusy || state.isAuthorizingTun || state.binary == nil)
+                                .help(state.engine.isRunning ? "将先停止核心，完成管理员授权后自动重启" : "授予管理员权限以安装 TUN 辅助组件")
                             }
-                            .controlSize(.small)
-                            .buttonStyle(.borderedProminent)
-                            .disabled(state.engine.isBusy || state.isAuthorizingTun || state.binary == nil)
-                            .help(state.engine.isRunning ? "将先停止核心，完成管理员授权后自动重启" : "授予管理员权限以同步 TUN 组件")
                         }
                     }
                 }
@@ -199,9 +228,9 @@ struct SettingsCoreView: View {
                     ProgressView().controlSize(.small)
                 }
                 StatusPill(
-                    state.killSwitchActive ? "已开启防泄漏" : "未开启",
-                    systemImage: state.killSwitchActive ? "lock.shield.fill" : "shield.slash",
-                    color: state.killSwitchActive ? .red : .secondary
+                    state.activeKillSwitchActive ? "已开启防泄漏" : "未开启",
+                    systemImage: state.activeKillSwitchActive ? "lock.shield.fill" : "shield.slash",
+                    color: state.activeKillSwitchActive ? .red : .secondary
                 )
             }
         } content: {
@@ -211,18 +240,18 @@ struct SettingsCoreView: View {
                         Toggle(
                             "核心未启动或重启/重载瞬间，内核级阻断物理网卡外网流量",
                             isOn: Binding(
-                                get: { state.killSwitchActive },
+                                get: { state.activeKillSwitchActive },
                                 set: { state.setKillSwitchEnabled($0) }
                             )
                         )
                         .disabled(state.isUpdatingKillSwitch || state.isAuthorizingTun)
-                        InlineNote("基于 macOS 原生 PF 防火墙独立 Anchor（\(KillSwitchRules.anchorName)），仅放行回环、utun 虚拟网卡与受信任的 TUN Mihomo 进程本身；重新授权、热重载重建 utun 或核心异常退出期间绝不回落国内默认网卡。")
+                        InlineNote("基于 macOS 原生 PF 防火墙独立 Anchor（\(TunHelperPFRules.anchorName)），仅放行回环、utun 虚拟网卡与受信任的 TUN Mihomo 进程本身；重新授权、热重载重建 utun 或核心异常退出期间绝不回落国内默认网卡。")
                     }
                 }
 
-                if state.killSwitchActive && !state.engine.isRunning {
+                if state.activeKillSwitchActive && !state.isCoreRunning {
                     FormRow("", labelWidth: 168) {
-                        InlineValidationMessage("当前核心未运行且断网保护已开启：本机外网（包括应用内订阅刷新与更新检查）均已被阻断。请启动 TUN 核心或关闭断网保护。", isError: true)
+                        InlineValidationMessage("当前核心未运行且断网保护已开启：外网流量已被阻断。请启动 TUN 核心或关闭断网保护。", isError: true)
                     }
                 }
 
@@ -239,7 +268,7 @@ struct SettingsCoreView: View {
                         Toggle(
                             "允许访问局域网私有网段（192.168.x.x / 10.x.x.x / 172.16.x.x）",
                             isOn: Binding(
-                                get: { state.killSwitchAllowLAN },
+                                get: { state.activeKillSwitchAllowLAN },
                                 set: { state.setKillSwitchAllowLAN($0) }
                             )
                         )
@@ -253,7 +282,7 @@ struct SettingsCoreView: View {
                         Toggle(
                             "系统启动登录前即加载断网保护规则（防开机瞬间泄漏）",
                             isOn: Binding(
-                                get: { state.killSwitchPersistOnBoot },
+                                get: { state.activeKillSwitchPersistOnBoot },
                                 set: { state.setKillSwitchPersistOnBoot($0) }
                             )
                         )
@@ -264,7 +293,7 @@ struct SettingsCoreView: View {
 
                 FormRow("应急恢复命令", labelWidth: 168) {
                     HStack(spacing: 8) {
-                        Text(KillSwitchRules.emergencyResetCommand)
+                        Text(TunHelperPFRules.emergencyResetCommand)
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
                             .padding(.horizontal, 8)
@@ -272,7 +301,7 @@ struct SettingsCoreView: View {
                             .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.10)))
                         Spacer()
                         Button("复制命令") {
-                            state.copyText(KillSwitchRules.emergencyResetCommand, label: "PF 应急恢复命令")
+                            state.copyText(TunHelperPFRules.emergencyResetCommand, label: "PF 应急恢复命令")
                         }
                         .controlSize(.small)
                     }
@@ -286,15 +315,15 @@ struct SettingsCoreView: View {
             HStack(spacing: 8) {
                 if state.profile.gatewayModeEnabled {
                     StatusPill(
-                        state.isIPForwardingEnabled ? "IP 转发已开启" : "IP 转发待启动",
-                        systemImage: state.isIPForwardingEnabled ? "arrow.triangle.branch" : "clock",
-                        color: state.isIPForwardingEnabled ? .teal : .secondary
+                        state.activeIsIPForwardingEnabled ? "IP 转发已开启" : "IP 转发待启动",
+                        systemImage: state.activeIsIPForwardingEnabled ? "arrow.triangle.branch" : "clock",
+                        color: state.activeIsIPForwardingEnabled ? .teal : .secondary
                     )
                 }
                 StatusPill(
-                    state.engine.isGatewayActive ? "网关运行中" : (state.profile.gatewayModeEnabled ? "已启用" : "未启用"),
-                    systemImage: state.engine.isGatewayActive ? "checkmark.circle.fill" : "circle",
-                    color: state.engine.isGatewayActive ? .teal : (state.profile.gatewayModeEnabled ? .cyan : .secondary)
+                    state.isGatewayActive ? "网关运行中" : (state.profile.gatewayModeEnabled ? "已启用" : "未启用"),
+                    systemImage: state.isGatewayActive ? "checkmark.circle.fill" : "circle",
+                    color: state.isGatewayActive ? .teal : (state.profile.gatewayModeEnabled ? .cyan : .secondary)
                 )
             }
         } content: {
@@ -548,52 +577,84 @@ private struct CoreBinaryCardView: View {
         } content: {
             VStack(alignment: .leading, spacing: 12) {
                 FormRow("当前内核状态", labelWidth: 128) {
-                    HStack(spacing: 8) {
-                        StatusPill(
-                            coreStore.source.title,
-                            systemImage: coreStore.binary == nil ? "exclamationmark.triangle" : "cpu",
-                            color: binarySourceColor
-                        )
-                        if let version = coreStore.version {
-                            StatusPill(version, color: .secondary)
-                        }
-                        Text(CoreBinaryStore.currentArchitecture)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-
-                        Spacer()
-
-                        if coreStore.isCheckingUpdate || coreStore.isUpdating {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-
-                        if coreStore.hasNewerVersion, let tag = coreStore.latestRelease?.tagName {
-                            Button(coreStore.binary == nil ? "下载 \(tag)" : "更新到 \(tag)") {
-                                state.installCoreUpdate()
+                    if state.isViewingRemote {
+                        let remoteSys = state.remoteClient.remoteFullState?.systemSettings
+                        let remoteSourceTitle = (remoteSys?.coreSourceTitle.isEmpty == false)
+                            ? (remoteSys?.coreSourceTitle ?? "远程内核")
+                            : "远程内核"
+                        HStack(spacing: 8) {
+                            StatusPill(remoteSourceTitle, systemImage: "cpu", color: .green)
+                            if let version = remoteSys?.coreVersion, !version.isEmpty {
+                                StatusPill(version, color: .secondary)
                             }
-                            .controlSize(.small)
-                            .buttonStyle(.borderedProminent)
-                            .disabled(coreStore.isUpdating || coreStore.isCheckingUpdate)
-                        } else {
-                            Button(coreStore.binary == nil ? "检查并下载内核" : "检查更新") {
+                            Spacer()
+                            if remoteSys?.hasNewerCoreVersion == true, let tag = remoteSys?.latestCoreTag {
+                                Button("更新到 \(tag)") {
+                                    state.installCoreUpdate()
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.borderedProminent)
+                            }
+                            Button("检查更新") {
                                 state.checkForCoreUpdate()
                             }
                             .controlSize(.small)
-                            .disabled(coreStore.isCheckingUpdate || coreStore.isUpdating)
                         }
-
-                        if coreStore.canResetToBundled {
-                            Button("恢复内置") {
-                                state.resetToBundledCore()
+                    } else {
+                        HStack(spacing: 8) {
+                            StatusPill(
+                                coreStore.source.title,
+                                systemImage: coreStore.binary == nil ? "exclamationmark.triangle" : "cpu",
+                                color: binarySourceColor
+                            )
+                            if let version = coreStore.version {
+                                StatusPill(version, color: .secondary)
                             }
-                            .controlSize(.small)
-                            .disabled(state.editingLocked || coreStore.isUpdating)
+                            Text(CoreBinaryStore.currentArchitecture)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+
+                            Spacer()
+
+                            if coreStore.isCheckingUpdate || coreStore.isUpdating {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+
+                            if coreStore.hasNewerVersion, let tag = coreStore.latestRelease?.tagName {
+                                Button(coreStore.binary == nil ? "下载 \(tag)" : "更新到 \(tag)") {
+                                    state.installCoreUpdate()
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.borderedProminent)
+                                .disabled(coreStore.isUpdating || coreStore.isCheckingUpdate)
+                            } else {
+                                Button(coreStore.binary == nil ? "检查并下载内核" : "检查更新") {
+                                    state.checkForCoreUpdate()
+                                }
+                                .controlSize(.small)
+                                .disabled(coreStore.isCheckingUpdate || coreStore.isUpdating)
+                            }
+
+                            if coreStore.canResetToBundled {
+                                Button("恢复内置") {
+                                    state.resetToBundledCore()
+                                }
+                                .controlSize(.small)
+                                .disabled(state.editingLocked || coreStore.isUpdating)
+                            }
                         }
                     }
                 }
 
-                if let msg = coreStore.updateMessage {
+                if state.isViewingRemote {
+                    if let remoteMsg = state.remoteClient.remoteFullState?.systemSettings.coreUpdateMessage,
+                       !remoteMsg.isEmpty {
+                        FormRow("", labelWidth: 128) {
+                            InlineValidationMessage(remoteMsg, isError: remoteMsg.contains("失败"))
+                        }
+                    }
+                } else if let msg = coreStore.updateMessage {
                     FormRow("", labelWidth: 128) {
                         HStack(spacing: 8) {
                             InlineValidationMessage(msg, isError: false)
@@ -607,14 +668,17 @@ private struct CoreBinaryCardView: View {
                     }
                 }
 
-                if let err = coreStore.updateError {
+                if !state.isViewingRemote, let err = coreStore.updateError {
                     FormRow("", labelWidth: 128) {
                         InlineValidationMessage(err, isError: true)
                     }
                 }
 
                 FormRow("本机控制端口", labelWidth: 128) {
-                    TextField("19090", value: $state.controllerPort, format: .number.grouping(.never))
+                    TextField("19090", value: Binding(
+                        get: { state.activeControllerPort },
+                        set: { state.setControllerPort($0) }
+                    ), format: .number.grouping(.never))
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 110)
                         .disabled(state.editingLocked)
@@ -651,7 +715,7 @@ private struct CoreBinaryCardView: View {
 
     private var binarySourceColor: Color {
         switch coreStore.source {
-        case .bundled: return .green
+        case .bundled, .authorized: return .green
         case .managed: return .blue
         case .system: return .teal
         case .none: return .orange
@@ -679,13 +743,13 @@ private struct EngineLogCardView: View {
 
                 Button("校验配置") { state.validate() }
                     .controlSize(.small)
-                    .disabled(state.editingLocked || state.binary == nil)
+                    .disabled(state.editingLocked || (!state.isViewingRemote && state.binary == nil))
                 Button("复制日志") {
                     state.copyText(logStore.text, label: "运行日志")
                 }
                 .controlSize(.small)
                 .disabled(logStore.isEmpty)
-                Button("清空") { state.engine.clearLog() }
+                Button("清空") { state.clearActiveLog() }
                     .controlSize(.small)
                     .disabled(logStore.isEmpty)
             }

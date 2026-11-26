@@ -42,7 +42,11 @@ struct NodeGroupEditorSheet: View {
     }
 
     private var liveMatchedNodes: [SubscriptionNode]? {
-        guard regexValid, excludeRegexValid, let subID = draft.subscriptionID, let entry = subscriptionStore.cache[subID] else {
+        guard regexValid,
+              excludeRegexValid,
+              let subID = draft.subscriptionID,
+              let entry = subscriptionStore.cache[subID],
+              entry.hasNodeDetails else {
             return nil
         }
         return SubscriptionParser.matchingNodes(

@@ -21,6 +21,10 @@ struct RuleGroupsView: View {
     @State private var showProcessPicker = false
     @State private var showSubconverterCatalog = false
     @State private var showRuleSetPicker = false
+    @State private var showClientDevicePicker = false
+    @State private var showRuleDevicePicker = false
+    @State private var newClientAddress = ""
+    @State private var newClientName = ""
 
     private var selectedGroupIndex: Int? {
         guard selectedGroupIDs.count == 1, let id = selectedGroupIDs.first else {
@@ -76,6 +80,27 @@ struct RuleGroupsView: View {
                         ruleSetBehavior: ruleSet.behavior,
                         ruleSetNoResolve: ruleSet.noResolve ? true : nil
                     )
+                }
+            }
+        }
+        .sheet(isPresented: $showClientDevicePicker) {
+            if let idx = selectedGroupIndex {
+                let existing = Set(state.profile.ruleGroups[idx].clientEntries.compactMap(\.normalizedCIDR))
+                DevicePickerSheet(state: state, existingCIDRs: existing) { entry in
+                    addClientEntry(entry, to: idx)
+                }
+            }
+        }
+        .sheet(isPresented: $showRuleDevicePicker) {
+            if let idx = selectedGroupIndex {
+                let existing = Set(
+                    state.profile.ruleGroups[idx].rules
+                        .filter { $0.type == .srcIPCIDR }
+                        .compactMap { ClientAddressValidator.normalizedCIDR($0.value) }
+                )
+                DevicePickerSheet(state: state, existingCIDRs: existing) { entry in
+                    let normalized = entry.normalizedCIDR ?? entry.address
+                    addRule(to: idx, type: .srcIPCIDR, value: normalized, note: entry.name)
                 }
             }
         }
@@ -146,10 +171,31 @@ struct RuleGroupsView: View {
                             .disabled(state.hotReloadEditingLocked)
 
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(group.name)
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(group.isEnabled ? .primary : .secondary)
-                                .lineLimit(1)
+                            HStack(spacing: 5) {
+                                Text(group.name)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(group.isEnabled ? .primary : .secondary)
+                                    .lineLimit(1)
+                                if group.clientScopeMode != .all {
+                                    let enabledCount = group.enabledClientEntries.count
+                                    let badgeText: String = {
+                                        if group.clientScopeMode == .include {
+                                            return enabledCount > 0 ? "仅限 \(enabledCount) 台" : "未选设备"
+                                        }
+                                        return enabledCount > 0 ? "排除 \(enabledCount) 台" : "排除 0 台"
+                                    }()
+                                    let badgeColor: Color = (group.clientScopeMode == .include && enabledCount == 0)
+                                        ? .red
+                                        : (group.clientScopeMode == .include ? .indigo : .orange)
+                                    Text(badgeText)
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(badgeColor)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Capsule().fill(badgeColor.opacity(0.14)))
+                                        .lineLimit(1)
+                                }
+                            }
                             HStack(spacing: 6) {
                                 Text("→ \(state.profile.targetTitle(for: group.target))")
                                     .font(.caption)
@@ -335,6 +381,159 @@ struct RuleGroupsView: View {
                                     }
                                 }
                             }
+
+                            FormRow("生效设备", labelWidth: 96) {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(spacing: 8) {
+                                        Picker(
+                                            "",
+                                            selection: Binding(
+                                                get: { state.profile.ruleGroups.first { $0.id == groupID }?.clientScopeMode ?? .all },
+                                                set: { newValue in
+                                                    guard let gIdx = state.profile.ruleGroups.firstIndex(where: { $0.id == groupID }) else { return }
+                                                    state.profile.ruleGroups[gIdx].clientScopeMode = newValue
+                                                }
+                                            )
+                                        ) {
+                                            ForEach(RuleGroupClientScopeMode.allCases) { mode in
+                                                Text(mode.title).tag(mode)
+                                            }
+                                        }
+                                        .labelsHidden()
+                                        .pickerStyle(.segmented)
+                                        .frame(maxWidth: 300)
+                                        .disabled(state.hotReloadEditingLocked)
+
+                                        if group.clientScopeMode != .all {
+                                            Button {
+                                                showClientDevicePicker = true
+                                            } label: {
+                                                Label("选择局域网设备", systemImage: "desktopcomputer")
+                                            }
+                                            .controlSize(.small)
+                                            .disabled(state.hotReloadEditingLocked)
+                                        }
+                                    }
+
+                                    if group.clientScopeMode != .all {
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            HStack(spacing: 8) {
+                                                TextField("输入 IP 或网段，如 192.168.1.55 或 192.168.1.0/24", text: $newClientAddress)
+                                                    .textFieldStyle(.roundedBorder)
+                                                    .disabled(state.hotReloadEditingLocked)
+                                                    .onSubmit { addManualClientEntry(to: idx) }
+
+                                                TextField("备注（可选）", text: $newClientName)
+                                                    .textFieldStyle(.roundedBorder)
+                                                    .frame(width: 130)
+                                                    .disabled(state.hotReloadEditingLocked)
+                                                    .onSubmit { addManualClientEntry(to: idx) }
+
+                                                Button("添加") { addManualClientEntry(to: idx) }
+                                                    .controlSize(.small)
+                                                    .disabled(
+                                                        state.hotReloadEditingLocked
+                                                            || newClientAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                                            || newClientAddressValidationError != nil
+                                                    )
+                                            }
+
+                                            if let err = newClientAddressValidationError {
+                                                InlineValidationMessage(err, isError: true)
+                                            }
+
+                                            if !group.clientEntries.isEmpty {
+                                                VStack(spacing: 0) {
+                                                    ForEach(Array(group.clientEntries.enumerated()), id: \.element.id) { cIdx, entry in
+                                                        let entryID = entry.id
+                                                        HStack(spacing: 8) {
+                                                            Toggle("", isOn: Binding(
+                                                                get: {
+                                                                    state.profile.ruleGroups
+                                                                        .first { $0.id == groupID }?
+                                                                        .clientEntries.first { $0.id == entryID }?
+                                                                        .isEnabled ?? false
+                                                                },
+                                                                set: { newValue in
+                                                                    guard let gIdx = state.profile.ruleGroups.firstIndex(where: { $0.id == groupID }),
+                                                                          let itemIdx = state.profile.ruleGroups[gIdx].clientEntries.firstIndex(where: { $0.id == entryID }) else {
+                                                                        return
+                                                                    }
+                                                                    state.profile.ruleGroups[gIdx].clientEntries[itemIdx].isEnabled = newValue
+                                                                }
+                                                            ))
+                                                            .labelsHidden()
+                                                            .toggleStyle(.checkbox)
+                                                            .disabled(state.hotReloadEditingLocked)
+
+                                                            Text(entry.normalizedCIDR ?? entry.address)
+                                                                .font(.system(.callout, design: .monospaced))
+                                                                .foregroundStyle(entry.isEnabled ? .primary : .secondary)
+                                                                .textSelection(.enabled)
+
+                                                            if !entry.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                                                Text(entry.name)
+                                                                    .font(.caption)
+                                                                    .foregroundStyle(.secondary)
+                                                            }
+
+                                                            if let mac = entry.macAddress, !mac.isEmpty {
+                                                                Text(mac)
+                                                                    .font(.system(.caption2, design: .monospaced))
+                                                                    .foregroundStyle(.tertiary)
+                                                            }
+
+                                                            if entry.normalizedCIDR == nil {
+                                                                StatusPill("格式无效", color: .red)
+                                                            }
+
+                                                            Spacer()
+
+                                                            Button(role: .destructive) {
+                                                                guard let gIdx = state.profile.ruleGroups.firstIndex(where: { $0.id == groupID }) else { return }
+                                                                state.profile.ruleGroups[gIdx].clientEntries.removeAll { $0.id == entryID }
+                                                            } label: {
+                                                                Image(systemName: "xmark.circle.fill")
+                                                                    .foregroundStyle(.tertiary)
+                                                            }
+                                                            .buttonStyle(.plain)
+                                                            .disabled(state.hotReloadEditingLocked)
+                                                        }
+                                                        .padding(.vertical, 4)
+                                                        if cIdx < group.clientEntries.count - 1 {
+                                                            Divider()
+                                                        }
+                                                    }
+                                                }
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 6)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.6))
+                                                )
+                                                .overlay {
+                                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                        .strokeBorder(Color.secondary.opacity(0.15))
+                                                        .allowsHitTesting(false)
+                                                }
+                                            }
+
+                                            if group.clientScopeMode == .include && group.enabledClientEntries.isEmpty {
+                                                InlineValidationMessage("尚未启用任何设备，此规则组当前不会对任何设备生效。", isError: true)
+                                            } else if group.clientScopeMode == .exclude && group.enabledClientEntries.isEmpty {
+                                                InlineNote("未添加排除设备，当前将对全部设备生效。")
+                                            }
+
+                                            if !state.profile.effectiveAllowLAN {
+                                                InlineNote("提示：当前未开启「透明网关」或「允许局域网连接」，局域网其他设备的流量不会经过本机。建议在路由器中为目标设备配置固定 IP。")
+                                            } else {
+                                                InlineNote("基于 Mihomo SUB-RULE + SRC-IP-CIDR 实现；建议在路由器中为目标设备绑定 DHCP 静态 IP，避免 IP 变动导致失效。")
+                                            }
+                                        }
+                                        .padding(.top, 2)
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -390,13 +589,28 @@ struct RuleGroupsView: View {
                                     .disabled(state.hotReloadEditingLocked)
                                     .onSubmit { addCustomRule(to: idx) }
 
+                                if newRuleType == .srcIPCIDR {
+                                    Button {
+                                        showRuleDevicePicker = true
+                                    } label: {
+                                        Label("选择设备", systemImage: "desktopcomputer")
+                                    }
+                                    .controlSize(.small)
+                                    .disabled(state.hotReloadEditingLocked)
+                                }
+
                                 Button("添加") { addCustomRule(to: idx) }
                                     .buttonStyle(.borderedProminent)
                                     .disabled(
                                         state.hotReloadEditingLocked
                                             || newRuleValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                             || (newRuleType == .ruleSet && newRuleSetValidationError != nil)
+                                            || (newRuleType == .srcIPCIDR && newSrcIPValidationError != nil)
                                     )
+                            }
+
+                            if newRuleType == .srcIPCIDR, let err = newSrcIPValidationError {
+                                InlineValidationMessage(err, isError: true)
                             }
 
                             if newRuleType == .ruleSet {
@@ -475,7 +689,9 @@ struct RuleGroupsView: View {
 
                                         StatusPill(
                                             rule.type.shortLabel,
-                                            color: rule.type == .ruleSet ? .teal : (rule.type.isProcessRule ? .purple : .blue)
+                                            color: rule.type == .ruleSet
+                                                ? .teal
+                                                : (rule.type == .srcIPCIDR ? .orange : (rule.type.isProcessRule ? .purple : .blue))
                                         )
                                         .frame(width: 82, alignment: .leading)
 
@@ -667,6 +883,49 @@ struct RuleGroupsView: View {
         return (try? RuleSetResolver.resolve(url: trimmed, format: newRuleSetFormat, behavior: newRuleSetBehavior))?.hint
     }
 
+    private var newClientAddressValidationError: String? {
+        let trimmed = newClientAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if ClientAddressValidator.normalizedCIDR(trimmed) == nil {
+            return "请输入有效的 IPv4/IPv6 地址或 CIDR 网段（例如 192.168.1.55 或 192.168.1.0/24）。"
+        }
+        return nil
+    }
+
+    private var newSrcIPValidationError: String? {
+        let trimmed = newRuleValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if ClientAddressValidator.normalizedCIDR(trimmed) == nil {
+            return "请输入有效的 IPv4/IPv6 地址或 CIDR 网段（例如 192.168.1.55 或 192.168.1.0/24）。"
+        }
+        return nil
+    }
+
+    private func addManualClientEntry(to groupIndex: Int) {
+        let trimmed = newClientAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, ClientAddressValidator.normalizedCIDR(trimmed) != nil else { return }
+        let note = newClientName.trimmingCharacters(in: .whitespacesAndNewlines)
+        addClientEntry(RuleGroupClientEntry(address: trimmed, name: note), to: groupIndex)
+        newClientAddress = ""
+        newClientName = ""
+    }
+
+    private func addClientEntry(_ entry: RuleGroupClientEntry, to groupIndex: Int) {
+        guard state.profile.ruleGroups.indices.contains(groupIndex) else { return }
+        guard let normalized = entry.normalizedCIDR else { return }
+        let exists = state.profile.ruleGroups[groupIndex].clientEntries.contains {
+            $0.normalizedCIDR == normalized
+        }
+        if !exists {
+            var stored = entry
+            stored.address = normalized
+            state.profile.ruleGroups[groupIndex].clientEntries.append(stored)
+            state.showFeedback("已添加生效设备：\(stored.displayTitle)")
+        } else {
+            state.showFeedback("设备已存在：\(normalized)")
+        }
+    }
+
     @ViewBuilder
     private func ruleSetMetadataPopover(groupID: UUID, ruleID: UUID) -> some View {
         if let gIdx = state.profile.ruleGroups.firstIndex(where: { $0.id == groupID }),
@@ -764,6 +1023,9 @@ struct RuleGroupsView: View {
             newRuleSetFormat = .auto
             newRuleSetBehavior = .auto
             newRuleSetNoResolve = false
+        } else if newRuleType == .srcIPCIDR {
+            guard let normalized = ClientAddressValidator.normalizedCIDR(value) else { return }
+            addRule(to: groupIndex, type: .srcIPCIDR, value: normalized)
         } else {
             addRule(to: groupIndex, type: newRuleType, value: value)
         }
